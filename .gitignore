@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and local tools
+.venv/
+venv/
+.env
+.tools/
+
+# Datasets, checkpoints, and model caches
+data/
+datasets/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Generated experiment outputs
+artifacts/
+results/
+outputs/
+logs/
+wandb/
+slurm-*.out
+slurm-*.err
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Keep the pinned upstream source snapshot visible even when its directory
+# names match project-wide output patterns such as `datasets/`.
+!third_party/
+!third_party/jepa-wms/
+!third_party/jepa-wms/**
