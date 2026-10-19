@@ -30,6 +30,21 @@ and licensing information.
 Model checkpoints, datasets, environments, and generated experiment outputs
 are intentionally excluded from version control.
 
+## PushT environment smoke test
+
+The first reproducible path uses a dedicated project-local `.venv` with Python
+3.10.19. It does not install into Conda or reuse Conda packages.
+
+```bash
+bash code/scripts/setup_pusht_env.sh
+.venv/bin/python code/scripts/download_pusht_checkpoint.py
+.venv/bin/python code/scripts/check_env.py
+.venv/bin/python code/scripts/checkpoint_smoke.py --device cpu
+```
+
+See `docs/reproduction.md` for prerequisites, expected outputs, and checkpoint
+integrity information.
+
 ## Collaboration
 
 Keep changes focused and reviewable. Each experiment should record its config,
