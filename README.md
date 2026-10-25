@@ -30,20 +30,29 @@ and licensing information.
 Model checkpoints, datasets, environments, and generated experiment outputs
 are intentionally excluded from version control.
 
-## PushT environment smoke test
+## Environment
 
-The first reproducible path uses a dedicated project-local `.venv` with Python
-3.10.19. It does not install into Conda or reuse Conda packages.
+One project-local `.venv` (Python 3.10.19, from `requirements/project.lock`)
+serves both PushT and the project task, Meta-World Push. It does not install
+into Conda or reuse Conda packages.
 
 ```bash
-bash code/scripts/setup_pusht_env.sh
-.venv/bin/python code/scripts/download_pusht_checkpoint.py
+bash code/scripts/setup_env.sh
+.venv/bin/python code/scripts/download_checkpoint.py --env pusht
+.venv/bin/python code/scripts/download_checkpoint.py --env metaworld
 .venv/bin/python code/scripts/check_env.py
-.venv/bin/python code/scripts/checkpoint_smoke.py --device cpu
+.venv/bin/python code/scripts/checkpoint_smoke.py --env pusht
+MUJOCO_GL=egl .venv/bin/python code/scripts/checkpoint_smoke.py --env metaworld
+```
+
+Goal-photo intervention (proposal, Section 5):
+
+```bash
+MUJOCO_GL=egl .venv/bin/python code/experiments/goal_photo_sensitivity.py --device cuda
 ```
 
 See `docs/reproduction.md` for prerequisites, expected outputs, and checkpoint
-integrity information.
+integrity information, and `docs/goal_photo_sensitivity.md` for results.
 
 ## Collaboration
 
