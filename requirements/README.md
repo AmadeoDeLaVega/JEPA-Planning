@@ -1,14 +1,16 @@
 # Requirements
 
-`pusht.in` lists the direct dependencies for the released PushT evaluation
-path. `pusht.lock` is the fully resolved, hash-pinned CUDA 12.6 environment
-generated with:
+`project.in` lists the direct dependencies for the whole project (released
+DINO-WM inference on PushT and Meta-World Push). `project.lock` is the fully
+resolved, hash-pinned Linux x86-64 + CUDA 12.6 environment generated with:
 
 ```bash
-uv pip compile requirements/pusht.in \
+uv pip compile requirements/project.in \
   --torch-backend cu126 \
   --generate-hashes \
-  --output-file requirements/pusht.lock
+  --python-version 3.10 \
+  --python-platform x86_64-manylinux_2_28 \
+  --output-file requirements/project.lock
 ```
 
 The lockfile was tested with uv 0.9.4 and Python 3.10.19. The project setup

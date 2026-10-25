@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Load the released DINO-WM PushT checkpoint and run one CPU inference.
+"""Load a released DINO-WM checkpoint and run one CPU encode + predict step.
 
-This deliberately disables the optional RGB decoder head: encoding and latent
-prediction use the released backbone/predictor weights, while avoiding a large
-decoder download that is irrelevant to the feature-space experiments.
+Checks that the encoder, action-conditioned predictor, and proprioception
+encoder load and produce [B, T, 1, 16, 16, 384] patch features.
 """
 
 from __future__ import annotations
@@ -17,79 +16,12 @@ import time
 
 import numpy as np
 import torch
-import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from jepa_planning.model import load_world_model  # noqa: E402
 
 
-ROOT = Path(__file__).resolve().parents[2]
-UPSTREAM = ROOT / "third_party" / "jepa-wms"
-# Keep runtime caches project-local as well as the Python environment. This
-# avoids silently reading from or writing to a user's Conda/home environment.
-os.environ.setdefault("TORCH_HOME", str(ROOT / ".tools" / "torch"))
-os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".tools" / "matplotlib"))
-sys.path.insert(0, str(UPSTREAM))
-
-
-def build_model(checkpoint: Path, device: str = "cpu"):
-    from app.plan_common.datasets import get_data_stats
-    from app.plan_common.datasets.preprocessor import Preprocessor
-    from app.plan_common.datasets.transforms import make_inverse_transforms, make_transforms
-    from evals.simu_env_planning.eval import init_module
-
-    config_path = (
-        UPSTREAM
-        / "configs/evals/simu_env_planning/pt/dino-wm/"
-        / "pt_L2_cem_sourcedset_H6_nas6_ctxt2_r224_alpha0.1_ep96_decode.yaml"
-    )
-    with config_path.open() as handle:
-        cfg = yaml.safe_load(handle)
-
-    model_cfg = cfg["model_kwargs"]
-    data_cfg = model_cfg["data"]
-    aug_cfg = model_cfg["data_aug"]
-    pretrain_cfg = model_cfg["pretrain_kwargs"]
-
-    # The decoder is used only for visualizations, not encoding or planning.
-    pretrain_cfg["heads_cfg"] = {"architectures": {}}
-
-    stats = get_data_stats("pusht")
-    img_size = data_cfg["img_size"]
-    transform = make_transforms(
-        img_size=img_size,
-        normalize=aug_cfg["normalize"],
-        random_horizontal_flip=False,
-        random_resize_aspect_ratio=(1.0, 1.0),
-        random_resize_scale=(1.0, 1.0),
-        reprob=0.0,
-        auto_augment=False,
-        motion_shift=False,
-    )
-    inverse_transform = make_inverse_transforms(img_size=img_size, **aug_cfg)
-    preprocessor = Preprocessor(
-        action_mean=torch.tensor(stats["action_mean"]),
-        action_std=torch.tensor(stats["action_std"]),
-        state_mean=torch.tensor(stats["state_mean"]),
-        state_std=torch.tensor(stats["state_std"]),
-        proprio_mean=torch.tensor(stats["proprio_mean"]),
-        proprio_std=torch.tensor(stats["proprio_std"]),
-        transform=transform,
-        inverse_transform=inverse_transform,
-    )
-    model = init_module(
-        folder=str(checkpoint.parent),
-        checkpoint=checkpoint.name,
-        module_name=model_cfg["module_name"],
-        model_kwargs=pretrain_cfg,
-        wrapper_kwargs=model_cfg["wrapper_kwargs"],
-        cfgs_data=data_cfg,
-        device=torch.device(device),
-        action_dim=stats["action_dim"],
-        proprio_dim=stats["proprio_dim"],
-        preprocessor=preprocessor,
-    )
-    return model
-
-
-def render_frame() -> tuple[np.ndarray, np.ndarray]:
+def pusht_observation() -> dict[str, torch.Tensor]:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
 
@@ -98,47 +30,42 @@ def render_frame() -> tuple[np.ndarray, np.ndarray]:
     env.reset_to_state = np.array([80.0, 300.0, 250.0, 250.0, 0.35, 0.0, 0.0])
     observation, _ = env.reset()
     frame = env.render(mode="rgb_array")
-    proprio = observation["proprio"]
     env.close()
-    return frame, proprio
+    return {
+        "visual": torch.from_numpy(frame).permute(2, 0, 1)[None, None],
+        "proprio": torch.from_numpy(observation["proprio"])[None, None],
+    }
+
+
+def metaworld_observation() -> dict[str, torch.Tensor]:
+    from jepa_planning import metaworld_push
+
+    env = metaworld_push.make_push_env()
+    metaworld_push.reset_task(env, seed=7)
+    return metaworld_push.observe(env)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=ROOT / "checkpoints" / "dino_wm_pusht.pth.tar",
-    )
+    parser.add_argument("--env", choices=["pusht", "metaworld"], default="pusht")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    checkpoint = args.checkpoint.resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-
     started = time.perf_counter()
-    model = build_model(checkpoint, device=args.device)
+    model = load_world_model(args.env, device=args.device)
     load_seconds = time.perf_counter() - started
 
-    frame, proprio = render_frame()
-    visual = torch.from_numpy(frame).permute(2, 0, 1)[None, None]
-    observation = {
-        "visual": visual,
-        "proprio": torch.from_numpy(proprio)[None, None],
-    }
+    observation = pusht_observation() if args.env == "pusht" else metaworld_observation()
     with torch.inference_mode():
         encoded = model.encode(observation)
-        # One zero-action step verifies the released transition model too.
-        # PushT has 2-D controls, grouped over the configured frameskip of 5.
-        actions = torch.zeros(
-            (1, 1, model.action_dim), dtype=torch.float32, device=model.device
-        )
+        # One zero-action step checks the predictor too. A model action is
+        # 5 env actions (the frameskip) concatenated.
+        actions = torch.zeros((1, 1, model.action_dim), dtype=torch.float32, device=model.device)
         predicted = model.unroll(encoded, actions)
 
     result = {
-        "checkpoint": str(checkpoint.relative_to(ROOT)),
+        "env": args.env,
         "device": str(model.device),
         "load_seconds": round(load_seconds, 3),
         "encoded_shape": list(encoded["visual"].shape),

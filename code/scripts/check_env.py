@@ -41,8 +41,9 @@ def main() -> None:
     if Path(torch.hub.get_dir()).resolve() != (ROOT / ".tools/torch/hub").resolve():
         errors.append(f"torch hub cache escaped project: {torch.hub.get_dir()}")
     required = [
-        ROOT / "requirements/pusht.lock",
+        ROOT / "requirements/project.lock",
         ROOT / "checkpoints/dino_wm_pusht.pth.tar",
+        ROOT / "checkpoints/dino_wm_metaworld.pth.tar",
         ROOT / "third_party/jepa-wms",
     ]
     errors.extend(f"missing required path: {path}" for path in required if not path.exists())

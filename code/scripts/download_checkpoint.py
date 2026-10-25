@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and verify the released DINO-WM PushT checkpoint."""
+"""Download and verify a released DINO-WM checkpoint (PushT or Meta-World)."""
 
 from __future__ import annotations
 
@@ -10,9 +10,19 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/jepa-wms/pt_dino-wm.pth.tar"
-CHECKPOINT_SHA256 = "8ec9cb05f22812d7f12e3c216b0637f41641055c0653e503e2746edb981b550f"
-CHECKPOINT_BYTES = 274_877_419
+# env -> (url, sha256, size in bytes)
+CHECKPOINTS = {
+    "pusht": (
+        "https://dl.fbaipublicfiles.com/jepa-wms/pt_dino-wm.pth.tar",
+        "8ec9cb05f22812d7f12e3c216b0637f41641055c0653e503e2746edb981b550f",
+        274_877_419,
+    ),
+    "metaworld": (
+        "https://dl.fbaipublicfiles.com/jepa-wms/mw_dino-wm.pth.tar",
+        "eab6e241f732db986f98ad224115ed7949ab4ff3f6cc8bc8f95b273cdb9e5d13",
+        280_902_699,
+    ),
+}
 
 
 def sha256(path: Path) -> str:
@@ -25,15 +35,13 @@ def sha256(path: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=ROOT / "checkpoints" / "dino_wm_pusht.pth.tar",
-    )
+    parser.add_argument("--env", choices=CHECKPOINTS, default="pusht")
+    parser.add_argument("--output", type=Path, help="default: checkpoints/dino_wm_<env>.pth.tar")
     args = parser.parse_args()
-    destination = args.output.resolve()
+    url, expected_sha256, expected_bytes = CHECKPOINTS[args.env]
+    destination = (args.output or ROOT / "checkpoints" / f"dino_wm_{args.env}.pth.tar").resolve()
 
-    if destination.is_file() and sha256(destination) == CHECKPOINT_SHA256:
+    if destination.is_file() and sha256(destination) == expected_sha256:
         print(f"Checkpoint already verified: {destination}")
         return
     if destination.exists():
@@ -47,7 +55,7 @@ def main() -> None:
         partial.unlink()
 
     request = urllib.request.Request(
-        CHECKPOINT_URL,
+        url,
         headers={"User-Agent": "JEPA-Planning checkpoint downloader"},
     )
     try:
@@ -57,7 +65,7 @@ def main() -> None:
 
         actual_size = partial.stat().st_size
         actual_hash = sha256(partial)
-        if actual_size != CHECKPOINT_BYTES or actual_hash != CHECKPOINT_SHA256:
+        if actual_size != expected_bytes or actual_hash != expected_sha256:
             raise RuntimeError(
                 "Checkpoint verification failed: "
                 f"size={actual_size}, sha256={actual_hash}"
@@ -68,7 +76,7 @@ def main() -> None:
         raise
 
     print(f"Downloaded and verified checkpoint: {destination}")
-    print(f"SHA-256: {CHECKPOINT_SHA256}")
+    print(f"SHA-256: {expected_sha256}")
 
 
 if __name__ == "__main__":
