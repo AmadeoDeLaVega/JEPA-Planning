@@ -54,6 +54,10 @@ MUJOCO_GL=egl .venv/bin/python code/experiments/goal_photo_sensitivity.py --devi
 See `docs/reproduction.md` for prerequisites, expected outputs, and checkpoint
 integrity information, and `docs/goal_photo_sensitivity.md` for results.
 
+The closed-loop Meta-World Push baseline runs through
+`code/experiments/run_baseline.py`. Its protocol, commands, outputs, and tests
+are documented in `docs/reproduction.md`.
+
 ## Coding Requirements
 
 All team-authored code should satisfy the following standards.
