@@ -41,6 +41,7 @@ from PIL import Image  # noqa: E402
 import torch  # noqa: E402
 
 from jepa_planning import ROOT, metaworld_push as mp  # noqa: E402
+from jepa_planning.goal_costs import mean_squared_goal_distance  # noqa: E402
 from jepa_planning.model import load_world_model  # noqa: E402
 
 WARMUP_STEPS = 40
@@ -65,10 +66,6 @@ def predict_endpoints(model, z_start, actions: torch.Tensor) -> torch.Tensor:
     return torch.cat(
         [model.unroll(z_start, actions[:, i : i + BATCH])["visual"][-1] for i in range(0, actions.shape[1], BATCH)]
     )
-
-
-def cost(endpoints: torch.Tensor, goal: torch.Tensor) -> np.ndarray:
-    return (endpoints - goal).pow(2).mean(dim=(1, 2, 3, 4)).cpu().numpy()
 
 
 def goal_photos(env, goal_snap: dict, rng: np.random.Generator):
@@ -131,8 +128,10 @@ def run_task(env, model, seed: int, rng: np.random.Generator, photo_dir: Path) -
     # 5. Compare the candidates selected with photo L and with photo R.
     row = {"seed": seed, "hand_separation_cm": 100 * hand_separation}
     for name, features in endpoints.items():
-        sel_l = int(np.argmin(cost(features, goals[0:1])))
-        sel_r = int(np.argmin(cost(features, goals[1:2])))
+        costs_l = mean_squared_goal_distance(features, goals[0:1]).cpu().numpy()
+        costs_r = mean_squared_goal_distance(features, goals[1:2]).cpu().numpy()
+        sel_l = int(np.argmin(costs_l))
+        sel_r = int(np.argmin(costs_r))
         row |= {
             f"{name}_selection_changed": sel_l != sel_r,
             f"{name}_success_changed": bool(success[sel_l] != success[sel_r]),
