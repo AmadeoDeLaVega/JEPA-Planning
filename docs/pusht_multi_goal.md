@@ -74,21 +74,37 @@ Outputs record the effective config, checkpoint path, Git revision and dirty
 status, software versions, command, runtime, GPU, and Slurm identifiers. Output
 directories must be new; scripts refuse to overwrite existing runs.
 
-## Existing Local evidence
+## Reproduced results
 
-The earlier Local implementation produced the following preliminary results.
-They motivate this cleaned implementation but are not copied into tracked
-`results/` and should be regenerated from this repository before final reporting.
+The cleaned implementation was evaluated from clean Git revision `80d45ed2`
+with the verified official PushT checkpoint on NVIDIA RTX A4000 GPUs. All ten
+Slurm tasks completed with exit code zero. Fixed-bank runs used array job
+`8153883`; closed-loop runs used array job `8153762`.
 
-- Fixed action bank: five seeds × 30 tasks, 64 candidates, eight equivalent
-  goals. Predicted-latent regret decreased from 5.300 with one goal to 3.267
-  with four and 2.876 with eight. The paired four-versus-one improvement was
-  2.034 with hierarchical 95% interval [1.169, 2.990], positive in all five
-  seed banks.
-- Paired closed-loop CEM: five seeds × six episodes. Mean final physical error
-  decreased from 43.932 to 30.749. The paired improvement was 13.184 with
-  hierarchical 95% interval [2.119, 26.838], positive in all five banks. The
-  success-rate improvement was not statistically resolved.
+For action-predicted candidates in the fixed-bank experiment, regret decreased
+monotonically as more equivalent goal photos were averaged:
+
+| Goal photos | Physical regret ↓ | 95% hierarchical interval |
+|---:|---:|---:|
+| 1 | 5.309 | [3.911, 6.756] |
+| 2 | 3.763 | [2.551, 5.189] |
+| 4 | 3.270 | [2.080, 4.667] |
+| 8 | 2.876 | [1.696, 4.367] |
+
+The paired four-versus-one regret improvement was 2.039 with 95% interval
+[1.208, 2.980]. All five seed-bank means were positive, so the pre-registered
+fixed-bank criterion was confirmed.
+
+In the paired closed-loop experiment, mean final physical error decreased from
+43.932 for one goal to 30.786 for four goals. The paired improvement was 13.147
+with 95% interval [2.109, 26.784], positive in all five seed banks; the primary
+closed-loop criterion was therefore confirmed. Ever-success increased from
+0.400 to 0.467, but its paired interval [-0.100, 0.233] crossed zero.
+
+Raw per-seed outputs and aggregate CSV files are under
+`results/pusht_multi_goal_probe/` and
+`results/pusht_multi_goal_closed_loop/`. These generated files are intentionally
+ignored by Git; this report preserves the durable results.
 
 These findings support multi-goal averaging as a suitable course-project
 baseline. They do not establish broad task generality, and the success metric
