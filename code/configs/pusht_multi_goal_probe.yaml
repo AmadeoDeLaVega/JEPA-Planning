@@ -1,0 +1,9 @@
+# Fixed action-bank confirmation of equivalent-goal averaging on PushT.
+seed: 20261008
+tasks: 30
+candidates_per_task: 64
+goals_per_task: 8
+goal_counts: [1, 2, 4, 8]
+controls_per_candidate: 5
+batch_size: 16
+action_clip: 2.0
