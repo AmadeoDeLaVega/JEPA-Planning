@@ -54,6 +54,16 @@ MUJOCO_GL=egl .venv/bin/python code/experiments/goal_photo_sensitivity.py --devi
 See `docs/reproduction.md` for prerequisites, expected outputs, and checkpoint
 integrity information, and `docs/goal_photo_sensitivity.md` for results.
 
+The equivalent-goal PushT experiments compare terminal feature MSE to one goal
+photo against the mean over several photos with the same object target. See
+`docs/pusht_multi_goal.md` for the hypothesis, fixed-bank and closed-loop
+protocols, commands, and full results. In a five-seed reproduction, four-goal
+averaging reduced fixed-bank predicted-latent regret from 5.309 to 3.270
+(paired improvement 2.039, 95% interval [1.208, 2.980]) and closed-loop final
+physical error from 43.932 to 30.786 (paired improvement 13.147, 95% interval
+[2.109, 26.784]). Both primary comparisons were positive in all five seed
+banks.
+
 The closed-loop Meta-World Push baseline runs through
 `code/experiments/run_baseline.py`. Its protocol, commands, outputs, and tests
 are documented in `docs/reproduction.md`.

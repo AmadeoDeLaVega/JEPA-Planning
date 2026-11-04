@@ -1,0 +1,13 @@
+# Reduced-budget paired closed-loop confirmation on PushT.
+seed: 20261108
+episodes: 6
+goals_per_episode: 4
+target_candidates: 128
+controls_per_chunk: 5
+cem_horizon: 2
+replans: 4
+cem_samples: 64
+cem_elites: 8
+cem_iterations: 2
+batch_size: 16
+action_clip: 2.0

@@ -168,3 +168,11 @@ Tests use a small CPU model and simulator double to check bounded actions,
 batching, CEM optimization, paired replay, goal invariance, step limits, config
 validation, and aggregation. The smoke command requires the actual simulator
 and checkpoint; that validation remains pending.
+
+## PushT equivalent-goal experiments
+
+`docs/pusht_multi_goal.md` documents the one-versus-many goal hypothesis and
+the two-stage protocol. The fixed-bank probe and paired closed-loop CEM test use
+the same released PushT checkpoint described above. Small CPU integration runs
+are available through `--smoke`; full runs must use the Slurm launchers in
+`code/scripts/`.
