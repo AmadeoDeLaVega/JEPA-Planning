@@ -64,6 +64,10 @@ physical error from 43.932 to 30.786 (paired improvement 13.147, 95% interval
 [2.109, 26.784]). Both primary comparisons were positive in all five seed
 banks.
 
+The learned temporal cost replaces feature similarity with predicted steps to
+the goal, trained from trajectory frame gaps. See `docs/pusht_temporal_cost.md`
+for the motivation, method, commands, and results.
+
 The closed-loop Meta-World Push baseline runs through
 `code/experiments/run_baseline.py`. Its protocol, commands, outputs, and tests
 are documented in `docs/reproduction.md`.

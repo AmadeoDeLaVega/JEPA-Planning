@@ -1,0 +1,12 @@
+# Temporal goal cost trained on recorded PushT trajectories.
+seed: 20261201
+episodes: 18685
+frame_stride: 5      # environment frames per model step
+max_gap: 24          # model steps, longer gaps and other-episode goals count as far
+far_fraction: 0.25
+width: 64
+hidden: 256
+batch_size: 128
+train_steps: 20000
+learning_rate: 0.0003
+encode_batch_size: 64

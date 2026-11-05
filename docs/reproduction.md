@@ -176,3 +176,43 @@ the two-stage protocol. The fixed-bank probe and paired closed-loop CEM test use
 the same released PushT checkpoint described above. Small CPU integration runs
 are available through `--smoke`; full runs must use the Slurm launchers in
 `code/scripts/`.
+
+## PushT temporal-cost data
+
+`docs/pusht_temporal_cost.md` trains on the DINO-WM `pusht_noise` trajectories.
+Download them from the DINO-WM project into the ignored `data/` directory:
+
+```bash
+mkdir -p data
+curl -fL -o data/pusht_noise.zip \
+  "https://osf.io/download/k2d8w/?view_only=a56a296ce3b24cceaf408383a175ce28"
+echo "442f5dee246edf670964ed7bdecd248683cd6d00580fa0e4d458abb53f92da08  data/pusht_noise.zip" \
+  | sha256sum -c -
+python3 -m zipfile -e data/pusht_noise.zip data/
+```
+
+The gated `pusht/pusht_noise.zip` in the Hugging Face `facebook/jepa-wms` dataset
+has the same SHA-256.
+
+## GPUs not supported by the pinned build
+
+`torch==2.7.0+cu126` has no kernels for newer GPUs such as the RTX 5070 Ti
+(`sm_120`). It fails with `no kernel image is available for execution on the
+device`. Do not change the lockfile. Create a separate environment outside the
+repository that differs only in the CUDA build, after `.venv` exists:
+
+```bash
+export UV_PYTHON_INSTALL_DIR="$PWD/.tools/python" UV_CACHE_DIR="$PWD/.tools/uv-cache"
+uv venv ~/jepa-venv-cu128 --python 3.10.19 --managed-python --seed
+uv pip install --python ~/jepa-venv-cu128/bin/python torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/python -m pip freeze | grep -vE "^(torch==|torchvision==|triton==|nvidia-|-e )" \
+  > /tmp/project-rest.txt
+uv pip install --python ~/jepa-venv-cu128/bin/python --no-deps -r /tmp/project-rest.txt
+uv pip install --python ~/jepa-venv-cu128/bin/python --no-deps --editable third_party/jepa-wms
+```
+
+Only `torch`, `torchvision`, and their `nvidia-*` libraries differ from the pinned
+environment. `code/scripts/check_env.py` still expects the pinned build and will
+reject this one. On this environment, the multi-goal experiments reproduce the
+reported results; see `docs/pusht_temporal_cost.md`.
