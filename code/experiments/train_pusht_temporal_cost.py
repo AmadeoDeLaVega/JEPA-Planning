@@ -3,7 +3,13 @@
 
 Frames are encoded once with the frozen DINO-WM encoder, then pairs of cached
 features train :class:`TemporalCost` to predict their separation in model steps.
-Only the cost is trained; the world model stays frozen.
+A second loss, weighted by ``ordering_weight``, asks the cost to score a frame
+at least one step lower than the frame before it, for the same goal. Planning
+compares candidates that are about one step apart, and the regression alone was
+imprecise at that scale. Only the cost is trained, the world model stays frozen.
+
+The weights saved are those with the best score on a fixed sample of validation
+pairs, which comes from separate scenes.
 
 Run from the repository root after downloading ``pusht_noise`` into ``data/``::
 
@@ -18,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from copy import deepcopy
 from pathlib import Path
 import pickle
 import subprocess
@@ -33,15 +40,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from jepa_planning import ROOT  # noqa: E402
 from jepa_planning.model import load_world_model  # noqa: E402
-from jepa_planning.temporal_cost import TemporalCost, sample_pairs  # noqa: E402
+from jepa_planning.temporal_cost import TemporalCost, one_step_closer, sample_pairs  # noqa: E402
 
 FEATURE_SIZE = 16 * 16 * 384
+VALIDATION_PAIRS = 4096
 CONFIG_FIELDS = {
     "seed",
     "episodes",
     "frame_stride",
     "max_gap",
     "far_fraction",
+    "ordering_weight",
     "width",
     "hidden",
     "batch_size",
@@ -55,13 +64,15 @@ def validate_config(config: dict) -> None:
     """Reject incomplete or invalid training configurations."""
     if not isinstance(config, dict) or set(config) != CONFIG_FIELDS:
         raise ValueError(f"config fields must be {sorted(CONFIG_FIELDS)}")
-    for field in CONFIG_FIELDS - {"seed", "far_fraction", "learning_rate"}:
+    for field in CONFIG_FIELDS - {"seed", "far_fraction", "ordering_weight", "learning_rate"}:
         if type(config[field]) is not int or config[field] < 1:
             raise ValueError(f"{field} must be a positive integer")
     if type(config["seed"]) is not int or not 0 <= config["seed"] < 2**32:
         raise ValueError("seed must fit uint32")
     if not 0 <= config["far_fraction"] <= 1:
         raise ValueError("far_fraction must be in [0, 1]")
+    if not math.isfinite(config["ordering_weight"]) or config["ordering_weight"] < 0:
+        raise ValueError("ordering_weight must be finite and non-negative")
     if not math.isfinite(config["learning_rate"]) or config["learning_rate"] <= 0:
         raise ValueError("learning_rate must be finite and positive")
 
@@ -96,31 +107,56 @@ def cache_features(model, split: Path, episodes: int, config: dict, path: Path) 
     return counts
 
 
-def pair_loss(cost: TemporalCost, cache: np.ndarray, pairs: tuple, device: torch.device) -> torch.Tensor:
-    """Return the Huber regression loss for sampled start, goal, and label arrays."""
+def losses(cost: TemporalCost, cache: np.ndarray, counts: np.ndarray, pairs: tuple, device: torch.device) -> tuple:
+    """Return the regression loss, the one-step ordering loss, and ordering accuracy."""
     starts, goals, labels = pairs
-    candidates = torch.from_numpy(np.asarray(cache[starts])).to(device)
-    targets = torch.from_numpy(np.asarray(cache[goals])).to(device)
-    return functional.smooth_l1_loss(cost(candidates, targets), torch.from_numpy(labels).to(device))
+    rows = lambda frames: torch.from_numpy(np.asarray(cache[frames])).to(device)
+    targets = rows(goals)
+    predicted = cost(rows(starts), targets)
+    regression = functional.smooth_l1_loss(predicted, torch.from_numpy(labels).to(device))
+    ordered, closer = one_step_closer(starts, goals, counts)
+    if not len(ordered):
+        zero = predicted.sum() * 0
+        return regression, zero, zero
+    margin = predicted[ordered] - cost(rows(closer), targets[ordered])
+    return regression, functional.relu(1 - margin).mean(), (margin > 0).float().mean()
 
 
-def train(cost: TemporalCost, cache, counts, val_cache, val_counts, config: dict, device) -> list[dict]:
-    """Fit the cost and return periodic training and validation losses."""
+@torch.no_grad()
+def validate(cost: TemporalCost, cache: np.ndarray, counts: np.ndarray, pairs: tuple, device, chunk: int = 512) -> dict:
+    """Average the losses over fixed validation pairs, in equal chunks."""
+    parts = [
+        losses(cost, cache, counts, tuple(array[start : start + chunk] for array in pairs), device)
+        for start in range(0, len(pairs[0]), chunk)
+    ]
+    names = ("val_loss", "val_ordering", "val_order_accuracy")
+    return {name: float(np.mean([part[index].item() for part in parts])) for index, name in enumerate(names)}
+
+
+def train(cost: TemporalCost, cache, counts, val_cache, val_counts, config: dict, device) -> tuple[list[dict], dict]:
+    """Fit the cost. Return periodic losses and the weights with the best validation score."""
     rng = np.random.default_rng(config["seed"])
-    optimizer = torch.optim.AdamW(cost.parameters(), lr=config["learning_rate"])
     sample = (config["batch_size"], config["max_gap"], config["far_fraction"], rng)
-    history = []
+    val_rng = np.random.default_rng(config["seed"] + 1)
+    val_pairs = sample_pairs(val_counts, VALIDATION_PAIRS, config["max_gap"], config["far_fraction"], val_rng)
+    weight = config["ordering_weight"]
+    optimizer = torch.optim.AdamW(cost.parameters(), lr=config["learning_rate"])
+    history, best_score, best_state = [], math.inf, None
     for step in range(1, config["train_steps"] + 1):
-        loss = pair_loss(cost, cache, sample_pairs(counts, *sample), device)
+        regression, ordering, _ = losses(cost, cache, counts, sample_pairs(counts, *sample), device)
         optimizer.zero_grad()
-        loss.backward()
+        (regression + weight * ordering).backward()
         optimizer.step()
         if step % max(1, config["train_steps"] // 20) == 0:
-            with torch.no_grad():
-                val_loss = pair_loss(cost, val_cache, sample_pairs(val_counts, *sample), device)
-            history.append({"step": step, "train_loss": loss.item(), "val_loss": val_loss.item()})
-            print(json.dumps(history[-1]), flush=True)
-    return history
+            row = {"step": step, "train_loss": regression.item(), "train_ordering": ordering.item()}
+            row.update(validate(cost, val_cache, val_counts, val_pairs, device))
+            score = row["val_loss"] + weight * row["val_ordering"]
+            if score < best_score:
+                best_score, best_state = score, deepcopy(cost.state_dict())
+                row["best"] = True
+            history.append(row)
+            print(json.dumps(row), flush=True)
+    return history, best_state
 
 
 def main() -> None:
@@ -143,6 +179,8 @@ def main() -> None:
         raise RuntimeError("CUDA is unavailable; use --device cpu for a smoke test")
 
     started = perf_counter()
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True))
     torch.manual_seed(config["seed"])
     args.output.mkdir(parents=True)
     model = load_world_model("pusht", str(device)).requires_grad_(False).eval()
@@ -153,13 +191,11 @@ def main() -> None:
     val_cache = np.memmap(args.output / "val.cache", dtype=np.float16, mode="r", shape=(int(val_counts.sum()), FEATURE_SIZE))
 
     cost = TemporalCost(width=config["width"], hidden=config["hidden"]).to(device)
-    history = train(cost, cache, counts, val_cache, val_counts, config, device)
-    torch.save({"state_dict": cost.state_dict(), "config": config}, args.output / "temporal_cost.pt")
+    history, best_state = train(cost, cache, counts, val_cache, val_counts, config, device)
+    torch.save({"state_dict": best_state, "config": config}, args.output / "temporal_cost.pt")
     for path in (args.output / "train.cache", args.output / "val.cache"):
         path.unlink()
 
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True))
     metadata = {
         "config": config,
         "git_revision": revision,
@@ -167,6 +203,7 @@ def main() -> None:
         "torch": torch.__version__,
         "command": sys.argv,
         "elapsed_seconds": perf_counter() - started,
+        "best_step": max(row["step"] for row in history if row.get("best")),
         "history": history,
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

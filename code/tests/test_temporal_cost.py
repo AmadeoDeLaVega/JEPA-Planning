@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from jepa_planning.temporal_cost import TemporalCost, photo_agreement, sample_pairs, target_response
+from jepa_planning.temporal_cost import TemporalCost, one_step_closer, photo_agreement, sample_pairs, target_response
 
 
 @pytest.fixture
@@ -109,6 +109,26 @@ def test_pairs_repeat_with_the_same_seed():
 def test_sample_pairs_rejects_invalid_arguments(counts, count, max_gap, far):
     with pytest.raises(ValueError):
         sample_pairs(np.array(counts), count, max_gap, far, np.random.default_rng(0))
+
+
+def test_closer_frames_are_one_step_nearer_the_same_goal():
+    counts = np.array([5, 30, 12])
+    starts, goals, _ = sample_pairs(counts, 500, 8, 0.3, np.random.default_rng(0))
+
+    ordered, closer = one_step_closer(starts, goals, counts)
+
+    np.testing.assert_array_equal(closer, starts[ordered] + 1)
+    assert np.all(closer <= goals[ordered])
+    np.testing.assert_array_equal(episode_of(closer, counts), episode_of(goals[ordered], counts))
+
+
+def test_far_and_zero_gap_pairs_have_no_closer_frame():
+    counts = np.array([4, 4])
+    starts, goals = np.array([0, 2, 3, 1]), np.array([5, 2, 3, 3])
+
+    ordered, _ = one_step_closer(starts, goals, counts)
+
+    np.testing.assert_array_equal(ordered, [3])
 
 
 def test_photo_agreement_counts_matching_photo_pairs():

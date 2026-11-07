@@ -97,6 +97,23 @@ def sample_pairs(
     return start_frames, goal_frames, labels
 
 
+def one_step_closer(
+    start_frames: np.ndarray,
+    goal_frames: np.ndarray,
+    frame_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find same-episode pairs whose goal lies ahead, and the frame one step closer.
+
+    Returns the indices of those pairs and, for each, the frame after its start.
+    A good cost scores that frame lower than the start, since it is one step
+    nearer the same goal.
+    """
+    ends = np.cumsum(frame_counts)
+    same = np.searchsorted(ends, start_frames, side="right") == np.searchsorted(ends, goal_frames, side="right")
+    ordered = np.flatnonzero(same & (goal_frames > start_frames))
+    return ordered, start_frames[ordered] + 1
+
+
 def photo_agreement(costs: np.ndarray) -> float:
     """Return how often two goal photos select the same candidate from [N, K] costs."""
     selected = np.asarray(costs).argmin(axis=0)
