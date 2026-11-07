@@ -114,6 +114,27 @@ def one_step_closer(
     return ordered, start_frames[ordered] + 1
 
 
+def blend_costs(mse: np.ndarray, temporal: np.ndarray, weight: float) -> np.ndarray:
+    """Return (1 - weight) * z(mse) + weight * z(temporal) for [N, K] costs.
+
+    N candidates are scored against K goals. The two costs have unrelated units,
+    so each is standardized over the candidates scored against the same goal
+    before mixing. A weight of 0 ranks candidates exactly as MSE does, and 1
+    exactly as the temporal cost does.
+    """
+    mse, temporal = np.asarray(mse, dtype=np.float64), np.asarray(temporal, dtype=np.float64)
+    if mse.shape != temporal.shape or mse.ndim != 2:
+        raise ValueError("cost matrices must both be [candidates, goals]")
+    if not 0 <= weight <= 1:
+        raise ValueError("blend weight must be in [0, 1]")
+
+    def standardized(costs: np.ndarray) -> np.ndarray:
+        spread = costs.std(axis=0)
+        return (costs - costs.mean(axis=0)) / np.where(spread > 0, spread, 1.0)
+
+    return (1 - weight) * standardized(mse) + weight * standardized(temporal)
+
+
 def photo_agreement(costs: np.ndarray) -> float:
     """Return how often two goal photos select the same candidate from [N, K] costs."""
     selected = np.asarray(costs).argmin(axis=0)

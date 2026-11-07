@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from jepa_planning.temporal_cost import TemporalCost, one_step_closer, photo_agreement, sample_pairs, target_response
+from jepa_planning.temporal_cost import TemporalCost, blend_costs, one_step_closer, photo_agreement, sample_pairs, target_response
 
 
 @pytest.fixture
@@ -129,6 +129,57 @@ def test_far_and_zero_gap_pairs_have_no_closer_frame():
     ordered, _ = one_step_closer(starts, goals, counts)
 
     np.testing.assert_array_equal(ordered, [3])
+
+
+def test_blend_with_zero_weight_ranks_like_mse():
+    rng = np.random.default_rng(0)
+    mse, temporal = rng.random((6, 3)), rng.random((6, 3))
+
+    blended = blend_costs(mse, temporal, 0.0)
+
+    np.testing.assert_array_equal(blended.argsort(axis=0), mse.argsort(axis=0))
+
+
+def test_blend_with_full_weight_ranks_like_temporal():
+    rng = np.random.default_rng(2)
+    mse, temporal = rng.random((6, 3)), rng.random((6, 3))
+
+    blended = blend_costs(mse, temporal, 1.0)
+
+    np.testing.assert_array_equal(blended.argsort(axis=0), temporal.argsort(axis=0))
+
+
+def test_blend_ignores_the_units_of_each_cost():
+    rng = np.random.default_rng(1)
+    mse, temporal = rng.random((6, 3)), rng.random((6, 3))
+
+    np.testing.assert_allclose(blend_costs(mse, temporal, 0.5), blend_costs(100 * mse + 3, 20 * temporal - 7, 0.5))
+
+
+def test_blend_standardizes_each_goal_separately():
+    mse = np.array([[0.0, 0.0], [1.0, 10.0]])
+    temporal = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+    blended = blend_costs(mse, temporal, 0.75)
+
+    np.testing.assert_allclose(blended, [[0.5, -1.0], [-0.5, 1.0]])
+
+
+def test_blend_keeps_a_constant_column_finite():
+    blended = blend_costs(np.ones((3, 1)), np.arange(3.0)[:, None], 1.0)
+
+    assert np.isfinite(blended).all()
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.5, float("nan")])
+def test_blend_rejects_invalid_weights(weight):
+    with pytest.raises(ValueError):
+        blend_costs(np.zeros((2, 2)), np.zeros((2, 2)), weight)
+
+
+def test_blend_rejects_mismatched_costs():
+    with pytest.raises(ValueError):
+        blend_costs(np.zeros((2, 2)), np.zeros((2, 3)), 1.0)
 
 
 def test_photo_agreement_counts_matching_photo_pairs():

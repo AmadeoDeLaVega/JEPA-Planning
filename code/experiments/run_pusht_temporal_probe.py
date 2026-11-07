@@ -12,6 +12,10 @@ time, and three questions are answered per task:
 Agreement alone is not enough, since a constant cost agrees perfectly. It only
 counts alongside a high target response.
 
+With ``--blend-weight`` a third method, ``blend``, scores candidates with
+``(1 - weight) * z(MSE) + weight * z(temporal)``, each standardized over the
+candidates for one goal photo.
+
 From the repository root::
 
     .venv/bin/python code/experiments/run_pusht_temporal_probe.py --device cuda \
@@ -42,7 +46,7 @@ from jepa_planning import ROOT  # noqa: E402
 from jepa_planning.goal_costs import pairwise_squared_goal_distance  # noqa: E402
 from jepa_planning.model import load_world_model  # noqa: E402
 from jepa_planning.pusht_multi_goal import encode_observations, selection_record  # noqa: E402
-from jepa_planning.temporal_cost import TemporalCost, photo_agreement, target_response  # noqa: E402
+from jepa_planning.temporal_cost import TemporalCost, blend_costs, photo_agreement, target_response  # noqa: E402
 
 METRICS = ("combined_error", "regret", "success", "rank_correlation")
 
@@ -106,6 +110,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--blend-weight", type=float, help="also score (1 - weight) * z(MSE) + weight * z(temporal)")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
 
@@ -129,11 +134,14 @@ def main() -> None:
 
     cost = load_cost(args.cost, device)
     methods = {"mse": mse_costs, "temporal": lambda x, g: temporal_costs(cost, x, g)}
+    if args.blend_weight is not None:
+        weight = args.blend_weight
+        methods["blend"] = lambda x, g: blend_costs(methods["mse"](x, g), methods["temporal"](x, g), weight)
     rows = evaluate(methods, predicted, goals, bank, config)
 
     args.output.mkdir(parents=True)
     write_csv(args.output / "task_rows.csv", rows)
-    (args.output / "metadata.json").write_text(json.dumps({"config": config, "cost": str(args.cost)}, indent=2) + "\n")
+    (args.output / "metadata.json").write_text(json.dumps({"config": config, "cost": str(args.cost), "blend_weight": args.blend_weight}, indent=2) + "\n")
     means = {
         method: {key: float(np.mean([row[key] for row in rows if row["method"] == method])) for key in rows[0] if key not in ("method", "task")}
         for method in methods
