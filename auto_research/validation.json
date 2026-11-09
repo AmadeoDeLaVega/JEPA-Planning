@@ -1,0 +1,59 @@
+{
+  "method": "In-process IPython InteractiveShell; actual code-cell and inline figure capture. No Jupyter kernel launch, new model calls, simulator calls or experiments.",
+  "python": "3.10.19 (main, Feb 12 2026, 00:42:18) [Clang 21.1.4 ]",
+  "versions": {
+    "numpy": "1.26.4",
+    "pandas": "2.2.3",
+    "matplotlib": "3.10.3",
+    "IPython": "8.39.0",
+    "nbformat": "5.10.4"
+  },
+  "runs": [
+    {
+      "notebook": "01_goal_geometry_and_metrics.ipynb",
+      "cwd": "repository root",
+      "code_cells": 6,
+      "seconds": 0.57,
+      "errors": 0,
+      "png_outputs": 2
+    },
+    {
+      "notebook": "02_search_and_gradients.ipynb",
+      "cwd": "repository root",
+      "code_cells": 8,
+      "seconds": 0.605,
+      "errors": 0,
+      "png_outputs": 2
+    },
+    {
+      "notebook": "01_goal_geometry_and_metrics.ipynb",
+      "cwd": "auto_research",
+      "code_cells": 6,
+      "seconds": 0.606,
+      "errors": 0,
+      "png_outputs": 2
+    },
+    {
+      "notebook": "02_search_and_gradients.ipynb",
+      "cwd": "auto_research",
+      "code_cells": 8,
+      "seconds": 0.547,
+      "errors": 0,
+      "png_outputs": 2
+    }
+  ],
+  "repository_tests": {
+    "scope": "Full existing research checkout; checkpoint-free tests, not model or physics replication",
+    "passed": 432,
+    "warnings": 11,
+    "seconds": 12.28,
+    "command": "OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MPLCONFIGDIR=/tmp/jepa-matplotlib PYTHONPATH=code .venv/bin/python -m pytest -q code/tests"
+  },
+  "independent_review": {
+    "isolated_standalone_execution": "passed with only auto_research companion files",
+    "evidence_files_byte_identical": 236,
+    "source_notebook_hashes_verified": 8,
+    "material_bugs_found": 0,
+    "figure_review": "Four unique captured figures inspected; all readable; count chart explicitly spans 0 to 20 tasks"
+  }
+}
