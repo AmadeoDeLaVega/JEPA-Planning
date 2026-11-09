@@ -1,0 +1,18 @@
+# Fitting the linear goal head on cached goal-group features.
+seed: 0
+# Head output ranks r; compression = 384 / r (96x, 48x, 24x, 12x, 6x, 3x, 1x).
+# The proposal's head is r = 32; r = 384 is a learned full-rank metric.
+ranks: [4, 8, 16, 32, 64, 128, 384]
+steps: 2000                    # identical for every allocation
+batch_size: 64                 # anchors per step, each with 1 positive + 7 negatives
+eval_every: 250
+resamples: 3
+budgets: [64, 256, 1024]
+hands_per_target: [2, 4, 8]
+# One grid per rank, chosen on validation groups (mean val AUROC over all
+# allocations, resample 0) and fixed before any test-split evaluation.
+grid:
+  tau: [0.01, 0.03, 0.1, 0.3, 1.0]
+  lr: [0.001, 0.003, 0.01]
+shuffled_control: true         # also fit every allocation with shuffled pair labels
+control_seeds: [0, 1, 2, 3, 4] # random-projection and coordinate-subset controls, at every rank

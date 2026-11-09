@@ -1,0 +1,13 @@
+# Paired closed-loop CEM for goal heads on PushT (plan step 6.4).
+# Planner budget matches the PushT multi-goal closed loop; it is identical for
+# every head, and every head gets the same CEM random numbers and start states.
+seed: 20261110
+controls_per_chunk: 5
+cem_horizon: 2
+replans: 4
+cem_samples: 64
+cem_elites: 8
+cem_iterations: 2
+batch_size: 64
+action_clip: 2.0
+goal_photos: 2

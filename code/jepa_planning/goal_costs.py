@@ -111,3 +111,35 @@ def pairwise_squared_goal_distance(
     goal_norm = goals.square().mean(dim=1).unsqueeze(0)
     cross_term = candidates.matmul(goals.transpose(0, 1)) / feature_count
     return (candidate_norm - 2 * cross_term + goal_norm).clamp_min(0)
+
+
+def linear_goal_distance(
+    candidate_features: torch.Tensor,
+    goal_features: torch.Tensor,
+    head: torch.Tensor,
+) -> torch.Tensor:
+    """Return the learned-head goal cost ``mean_i ||L (z_i - g_i)||^2`` (Eq. 3).
+
+    Args:
+        candidate_features: Candidate endpoint features ``[N, ..., D]``.
+        goal_features: Goal features with leading dimension ``1`` or ``N`` and
+            the same trailing dimensions.
+        head: The head matrix ``L`` with shape ``[r, D]``. It is shared by all
+            patches, so it acts only on the last (channel) dimension.
+
+    Returns:
+        A tensor of shape ``[N]``: squared projected distance summed over the
+        ``r`` head outputs and averaged over every other non-batch dimension
+        (the patches). With ``L = I_D / sqrt(D)`` this equals
+        :func:`mean_squared_goal_distance`.
+    """
+    _validate_feature_shapes(candidate_features, goal_features)
+    if goal_features.shape[0] not in (1, candidate_features.shape[0]):
+        raise ValueError("goal batch must contain one goal or one goal per candidate")
+    if head.ndim != 2 or head.shape[1] != candidate_features.shape[-1]:
+        raise ValueError("head must have shape [r, D] matching the feature dimension")
+    if head.device != candidate_features.device or head.dtype != candidate_features.dtype:
+        raise ValueError("head must match the feature device and dtype")
+
+    projected = (candidate_features - goal_features).matmul(head.transpose(0, 1))
+    return projected.square().sum(dim=-1).flatten(start_dim=1).mean(dim=1)

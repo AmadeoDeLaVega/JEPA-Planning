@@ -1,0 +1,10 @@
+# Fixed candidate bank for goal heads on PushT (plan steps 6.2 and 6.3).
+# Tasks are the goal-group targets of the chosen split; the bank's action
+# chunks come from their own seeded stream, independent of the targets.
+seed: 20261109
+candidates_per_task: 64
+horizon: 2            # chunks of 5 controls; matches the target construction and CEM
+controls_per_chunk: 5
+action_clip: 2.0
+goal_photos: 2        # proposal: two equivalent goal photos per task (group slots 0 and 1)
+batch_size: 32

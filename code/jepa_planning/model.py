@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+from pathlib import Path
 
 import torch
 import yaml
@@ -15,6 +17,29 @@ CONFIGS = {
     "pusht": _CONFIGS / "pt/dino-wm/pt_L2_cem_sourcedset_H6_nas6_ctxt2_r224_alpha0.1_ep96_decode.yaml",
     "metaworld": _CONFIGS / "mw/dino-wm/reach_L2_cem_sourcexp_H6_nas3_ctxt2_r224_alpha0.1_ep48_decode.yaml",
 }
+
+
+@contextlib.contextmanager
+def _offline_dinov2_hub():
+    """Load the DINOv2 hub repo from the local torch-hub cache when present.
+
+    ``torch.hub.load("facebookresearch/dinov2", ...)`` contacts GitHub to resolve
+    the default branch even when the repo is cached, so a GitHub outage breaks
+    model loading. The cached checkout is the same code, loaded with source="local".
+    """
+    cached = Path(torch.hub.get_dir()) / "facebookresearch_dinov2_main"
+    original = torch.hub.load
+
+    def load(repo_or_dir, model, *args, **kwargs):
+        if repo_or_dir == "facebookresearch/dinov2" and cached.is_dir() and "source" not in kwargs:
+            return original(str(cached), model, *args, source="local", **kwargs)
+        return original(repo_or_dir, model, *args, **kwargs)
+
+    torch.hub.load = load
+    try:
+        yield
+    finally:
+        torch.hub.load = original
 
 
 def load_world_model(env: str, device: str = "cpu"):
@@ -63,7 +88,35 @@ def load_world_model(env: str, device: str = "cpu"):
     )
     # What upstream's evals.simu_env_planning.eval.init_module does, without
     # importing the rest of its planning-eval code.
-    model = importlib.import_module(model_cfg["module_name"]).init_module(
+    with _offline_dinov2_hub():
+        model = _init_module(model_cfg, checkpoint, pretrain_cfg, data_cfg, device, stats, preprocessor)
+    _synchronous_proprio_copy(preprocessor, torch.device(device))
+    model.eval()
+    return model
+
+
+def _synchronous_proprio_copy(preprocessor, device: torch.device) -> None:
+    """Return normalized proprio already on ``device``, copied synchronously.
+
+    Upstream's ``encode`` normalizes proprio on the CPU and moves the temporary
+    with ``.to(device, non_blocking=True)``. On MPS the temporary can be freed
+    before the async copy reads it, so the predictor gets garbage proprio
+    (values up to ~1e32) and predicted endpoints are wrong. Encoder features and
+    CUDA are unaffected. Copying here makes upstream's ``.to`` a no-op; the values
+    are identical.
+    """
+    if device.type == "cpu":
+        return
+    normalize = preprocessor.normalize_proprios
+
+    def normalize_on_device(proprio):
+        return normalize(proprio).to(device, dtype=torch.float32)
+
+    preprocessor.normalize_proprios = normalize_on_device
+
+
+def _init_module(model_cfg, checkpoint, pretrain_cfg, data_cfg, device, stats, preprocessor):
+    return importlib.import_module(model_cfg["module_name"]).init_module(
         folder=str(checkpoint.parent),
         checkpoint=checkpoint.name,
         model_kwargs=pretrain_cfg,
@@ -74,5 +127,3 @@ def load_world_model(env: str, device: str = "cpu"):
         proprio_dim=stats["proprio_dim"],
         preprocessor=preprocessor,
     )
-    model.eval()
-    return model
