@@ -146,21 +146,6 @@ Not done yet from the proposal: nonlinear head, VICReg / SIGReg losses,
 coordinate-readout and object-mask comparisons, labelling-effort and compute-cost
 reports, and Meta-World Push.
 
-## Issue found and fixed: wrong predictions on Apple MPS
-
-The first bank run on the Mac showed predicted-endpoint regret of ~67 px for
-*every* cost. The team's CUDA probe had ~5 px, so this was not a real
-model limitation. Upstream `encode` normalizes proprio on the CPU and moves the
-temporary to the device with `non_blocking=True`. On MPS the temporary can be
-freed before the copy reads it, so the predictor received garbage proprio
-(values up to 1e32). Encoder features were unaffected, so training and 6.1 are
-valid. The fix is in our loader (`jepa_planning/model.py`,
-`_synchronous_proprio_copy`) and leaves CPU/CUDA untouched. With it, MPS
-predictions match CPU to 2.5e-5. The invalid run is kept as
-`results/pusht_head_bank_INVALID_mps_proprio_bug/`. The loader now also reads
-DINOv2 from the local torch-hub cache, so a GitHub outage no longer blocks
-model loading.
-
 ## Remaining work
 
 1. Closed loop, in this order (`configs/pusht_head_closed_loop_order.txt`):
