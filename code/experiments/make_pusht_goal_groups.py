@@ -41,6 +41,7 @@ from jepa_planning import pusht_goal_groups as pg  # noqa: E402
 
 
 def make_environment():
+    """jepa-wms PushT env as used by the checkpoint (224 px, target drawn, velocity proprio)."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
 
@@ -50,6 +51,7 @@ def make_environment():
 
 
 def main() -> None:
+    """Render one split's goal groups (and sensitivity photos) and write images + metadata."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", choices=pg.SPLITS, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "code/configs/pusht_goal_groups.yaml")
@@ -66,6 +68,7 @@ def main() -> None:
 
     from app.plan_common.datasets import get_data_stats
 
+    # The checkpoint's action normalization: chunks are sampled normalized, the env takes raw actions.
     stats = get_data_stats("pusht")
     action_mean, action_std = np.asarray(stats["action_mean"]), np.asarray(stats["action_std"])
     env = make_environment()
@@ -77,6 +80,8 @@ def main() -> None:
     started = perf_counter()
     try:
         for group in range(cfg["num_targets"][args.split]):
+            # One seeded stream per target: its pose (and the planning start state) can be
+            # rebuilt later from (seed, split, group) alone.
             rng = pg.target_rng(cfg, args.split, group)
             pose = pg.sample_target(env, rng, cfg, action_mean, action_std)
             targets.append(pose)
@@ -84,13 +89,14 @@ def main() -> None:
             photos, reasons = pg.render_group(env, pose, bank, order, needed, cfg["pose_tolerance"],
                                               cfg["min_agent_clearance"])
             rejected.update(reasons)
-            if len(photos) < needed:
+            if len(photos) < needed:  # bank exhausted before K agents were accepted
                 short.append({"group": group, "accepted": len(photos)})
             for slot, photo in enumerate(photos):
                 for key, value in [("visual", photo["visual"]), ("proprio", photo["proprio"]), ("group", group),
                                    ("slot", slot), ("agent", photo["agent"]),
                                    ("agent_bank_index", photo["agent_bank_index"]), ("object_pose", pose)]:
                     columns[key].append(value)
+            # Sensitivity photos (val/test only): T moved or rotated, agent of photo 0 kept.
             if args.split != "train" and photos:
                 for kind, amount, moved in pg.perturbed_poses(pose, cfg, rng):
                     observation, reason = pg.render_state(env, photos[0]["agent"], moved, cfg["pose_tolerance"],
@@ -106,13 +112,13 @@ def main() -> None:
     elapsed = perf_counter() - started
 
     arrays = {key: np.stack(value) for key, value in columns.items()}
-    arrays["proprio"] = arrays["proprio"].astype(np.float32)
+    arrays["proprio"] = arrays["proprio"].astype(np.float32)  # the encoder expects float32 proprio
     output.mkdir(parents=True)
     np.savez(output / "images.npz", target_poses=np.stack(targets), **arrays)
     if sensitivity["visual"]:
         np.savez(output / "sensitivity.npz", **{key: np.stack(value) for key, value in sensitivity.items()})
     images = len(arrays["group"])
-    tried = images + sum(rejected.values())
+    tried = images + sum(rejected.values())  # every agent attempt, accepted or rejected
     summary = {
         "split": args.split,
         "num_targets": cfg["num_targets"][args.split],

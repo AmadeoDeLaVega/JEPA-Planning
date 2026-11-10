@@ -51,6 +51,7 @@ from jepa_planning.pusht_multi_goal import sample_action_chunks, sample_initial_
 
 
 def make_environment():
+    """jepa-wms PushT env as used by the checkpoint (224 px, target drawn, velocity proprio)."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
 
@@ -64,11 +65,14 @@ def load_tasks(groups_dir: Path, split: str, photos: int) -> dict:
     group_cfg = json.loads((groups_dir / "metadata.json").read_text())["config"]
     images = np.load(groups_dir / "images.npz")
     targets = images["target_poses"]
+    # photo_index[t, s] = row in images.npz of target t's photo in slot s (-1 = missing).
     photo_index = np.full((len(targets), photos), -1)
     for index, (group, slot) in enumerate(zip(images["group"], images["slot"])):
         if slot < photos:
             photo_index[group, slot] = index
     keep = np.flatnonzero((photo_index >= 0).all(axis=1))
+    # The start state is the first draw of the target's own stream, exactly as when
+    # the target was built, so it does not need to be stored.
     initial = np.stack([sample_initial_state(pg.target_rng(group_cfg, split, int(i))) for i in keep])
     return {"group_cfg": group_cfg, "group": keep, "target": targets[keep], "initial": initial,
             "photo_index": photo_index[keep], "photo_object_pose": images["object_pose"][photo_index[keep]]}
@@ -89,6 +93,7 @@ def run_bank(env, tasks: dict, cfg: dict, split: str, action_mean, action_std) -
     out = {key: [] for key in ("initial_visual", "initial_proprio", "actions", "end_visual", "end_proprio",
                                "end_state")}
     for group, initial in zip(tasks["group"], tasks["initial"]):
+        # The bank's own seed: candidate actions are independent of how the target was built.
         rng = np.random.default_rng(np.random.SeedSequence([cfg["seed"], pg.SPLIT_STREAM[split], int(group)]))
         chunks = sample_action_chunks(rng, cfg["candidates_per_task"], cfg["horizon"], cfg["controls_per_chunk"],
                                       cfg["action_clip"])
@@ -97,7 +102,7 @@ def run_bank(env, tasks: dict, cfg: dict, split: str, action_mean, action_std) -
         out["initial_visual"].append(observation["visual"])
         out["initial_proprio"].append(observation["proprio"])
         out["actions"].append(chunks.reshape(len(chunks), cfg["horizon"], -1))
-        for chunk in chunks:
+        for chunk in chunks:  # every candidate starts from the same restored state
             env.reset_to_state = initial
             env.reset()
             for normalized_action in chunk.reshape(-1, 2):
@@ -115,9 +120,10 @@ def predict(model, bank: dict, batch_size: int) -> torch.Tensor:
     for task in range(len(bank["initial_visual"])):
         visual = torch.from_numpy(bank["initial_visual"][task]).permute(2, 0, 1)[None, None]
         proprio = torch.from_numpy(bank["initial_proprio"][task]).float()[None, None]
-        encoded = model.encode({"visual": visual, "proprio": proprio})
+        encoded = model.encode({"visual": visual, "proprio": proprio})  # encode the start once per task
         actions = bank["actions"][task]
         for start in range(0, len(actions), batch_size):
+            # unroll takes actions as [T, B, A] and returns [T+1, B, ...]; [-1] is the endpoint.
             batch = torch.from_numpy(actions[start : start + batch_size]).permute(1, 0, 2).to(model.device)
             features = model.unroll(encoded, batch)["visual"][-1]
             out.append(features.reshape(features.shape[0], -1, features.shape[-1]).half().cpu())
@@ -125,6 +131,7 @@ def predict(model, bank: dict, batch_size: int) -> torch.Tensor:
 
 
 def main() -> None:
+    """Build the bank in the simulator, encode/predict endpoints, score every head, write outputs."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", choices=("val", "test"), required=True)
     parser.add_argument("--groups", type=Path, help="goal-group directory (default results/pusht_goal_groups/<split>)")
@@ -152,6 +159,8 @@ def main() -> None:
     action_std = model.preprocessor.action_std.cpu().numpy()
     env = make_environment()
     try:
+        # Guard: rebuilding each target from its seed must give the stored pose,
+        # otherwise the start states derived from those seeds would be wrong too.
         target_error = verify_targets(env, tasks, args.split, action_mean, action_std)
         if target_error > 1e-3:
             raise RuntimeError(f"rebuilt targets differ from the stored ones by {target_error}")
@@ -162,6 +171,8 @@ def main() -> None:
         env.close()
 
     model_started = perf_counter()
+    # actual = encoder features of the simulated endpoints (step 6.2);
+    # predicted = the world model's rollout features, what the planner sees (step 6.3).
     sources = {"actual": encode_frames(model, bank["end_visual"], bank["end_proprio"], cfg["batch_size"]),
                "predicted": predict(model, bank, cfg["batch_size"])}
     model_seconds = perf_counter() - model_started
@@ -180,7 +191,7 @@ def main() -> None:
         for info, head in catalog:
             head = head.to(device)
             for task, group in enumerate(tasks["group"]):
-                candidates = features[task * count : (task + 1) * count]
+                candidates = features[task * count : (task + 1) * count]  # this task's 64 candidates
                 for photo in range(cfg["goal_photos"]):
                     costs = hp.head_costs(candidates, goals[task, photo].to(device).float(), head).cpu().numpy()
                     rows.append({"source": source, **info, "task": task, "group": int(group), "photo": photo,

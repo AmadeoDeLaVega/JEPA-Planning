@@ -64,6 +64,8 @@ def load_groups(directory: Path, device: str, min_images: int = 0):
     features = payload["groups"]
     if len(features) != len(groups):
         raise ValueError(f"{directory}: {len(features)} features for {len(groups)} images")
+    # Training needs K images of every target for the largest K, so targets that
+    # lost photos to rejections are dropped whole rather than half-used.
     ids, counts = np.unique(groups, return_counts=True)
     keep = np.isin(groups, ids[counts >= min_images])
     data = {"features": features[torch.from_numpy(keep)].to(device), "groups": groups[keep],
@@ -76,11 +78,13 @@ def load_groups(directory: Path, device: str, min_images: int = 0):
 
 
 def evaluate(head: torch.Tensor, val: dict) -> dict:
+    """Validation retrieval metrics and, if present, median sensitivity ratios per object move."""
     head = head.to(val["features"].device)
     metrics = lh.retrieval_metrics(val["features"], val["groups"], head)
     sens = val.get("sensitivity")
     if sens is not None:
-        # Reference = the group's first photo (same agent as the moved-object photos).
+        # Reference = the group's first photo (same agent as the moved-object photos),
+        # so only the T differs between the two photos of each pair.
         first = {g: np.flatnonzero(val["groups"] == g)[0] for g in np.unique(val["groups"])}
         usable = np.array([g in first for g in sens["group"]])
         reference = val["features"][torch.as_tensor([first[g] for g in sens["group"][usable]])]
@@ -88,11 +92,12 @@ def evaluate(head: torch.Tensor, val: dict) -> dict:
                                        metrics["within_median"])
         for kind, amount in sorted(set(zip(sens["kind"][usable], sens["amount"][usable]))):
             mask = (sens["kind"][usable] == kind) & (sens["amount"][usable] == amount)
-            metrics[f"sensitivity_{kind}_{amount:g}"] = float(np.median(ratios[mask]))
+            metrics[f"sensitivity_{kind}_{amount:g}"] = float(np.median(ratios[mask]))  # e.g. sensitivity_shift_px_20
     return metrics
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
+    """Write ``rows`` (dicts, union of keys as columns) to ``path``."""
     fields = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -101,6 +106,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def main() -> None:
+    """Run the τ/lr grid on val per rank, then all allocations × resamples and the controls."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--train", type=Path, required=True)
     parser.add_argument("--val", type=Path, required=True)
@@ -128,14 +134,18 @@ def main() -> None:
         raise ValueError(f"ranks must be between 1 and the feature dimension {dim}")
 
     def fit(rank, budget, targets, hands, resample, tau, lr, shuffled=False):
+        """Fit one head of ``rank`` on a B = M × K allocation; returns ``(head, curve)``."""
+        # The seed depends only on the resample, so resample r uses the same image
+        # selection and initial L for every rank and every tau/lr setting.
         sampler = lh.AllocationSampler(train["groups"], targets, hands, seed=cfg["seed"] * 1000 + resample,
                                        shuffle_labels=shuffled)
-        assert len(sampler.images) == budget
+        assert len(sampler.images) == budget  # exactly B = M * K images, as the proposal requires
         return lh.fit_head(train["features"], sampler, steps=cfg["steps"], batch_size=cfg["batch_size"], tau=tau,
                            lr=lr, seed=cfg["seed"] * 1000 + resample, rank=rank,
                            validation=(val["features"], val["groups"]), eval_every=cfg["eval_every"])
 
     def size(rank):
+        """Rank and compression (384 / rank) columns for an output row."""
         return {"rank": rank, "compression": dim / rank}
 
     (args.output / "heads").mkdir(parents=True)
@@ -155,7 +165,7 @@ def main() -> None:
                                   "val_auroc": scores[-1], "val_top1": curve[-1]["val_top1"]})
             means[(tau, lr)] = float(np.mean(scores))
             print(f"rank={rank} tau={tau} lr={lr} mean val AUROC={means[(tau, lr)]:.4f}", flush=True)
-        tau, lr = max(means, key=means.get)
+        tau, lr = max(means, key=means.get)  # highest mean val AUROC over the 9 allocations
         chosen[rank] = {"tau": tau, "lr": lr, "mean_val_auroc": means[(tau, lr)]}
 
         # 2. All allocations x resamples (+ shuffled labels) with the chosen pair.
@@ -163,6 +173,7 @@ def main() -> None:
         for (budget, targets, hands), resample, shuffled in itertools.product(
                 allocations, range(cfg["resamples"]), variants):
             if resample == 0 and not shuffled:
+                # Already fitted during the grid search with identical settings and seed.
                 head, curve = fitted[(tau, lr, budget, targets, hands)]
             else:
                 head, curve = fit(rank, budget, targets, hands, resample, tau, lr, shuffled)

@@ -15,6 +15,8 @@ CONFIG=code/configs/linear_head_training_mac.yaml
 mkdir -p "$OUT"
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$OUT/progress.log"; }
 
+# Render and encode run as separate processes: decord (model) and pygame (env)
+# bundle clashing SDL2 libraries on macOS.
 for split in train val test; do
   if [[ -f "$DATA/$split/summary.json" ]]; then
     log "render $split: already done"

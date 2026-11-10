@@ -1,6 +1,6 @@
 # Plan: learned linear goal head L (proposal §3–5)
 
-Status: in progress (Meta-World on `feature/linear-goal-head`; PushT on `feature/pusht-linear-goal-head`, results below).
+Status: in progress (Meta-World on `feature/linear-goal-head`; PushT on `feature/pusht-linear-goal-head`; PushT results in [`pusht_linear_head.md`](pusht_linear_head.md)).
 Done: step 1 (`goal_groups.py`, `make_goal_groups.py`, `configs/goal_groups.yaml`),
 the head, loss, sampler and control matrices (`linear_head.py`),
 `goal_costs.linear_goal_distance`, and CPU tests. The group generator has not yet
@@ -29,71 +29,13 @@ the PushT checkpoint and the multi-goal experiments use.
   varied over {4, 8, 16, 32, 64, 128, 384}, i.e. compression 384/r from 96x to
   1x (learned full-rank metric). Each rank gets its own τ/lr choice on val, the
   full 9 allocations × 3 resamples, the shuffled-label control, and random /
-  coordinate-subset controls of the same rank. Outputs carry `rank` and
+  coordinate-subset controls of the same rank (the Mac run used ranks 4/16/32/128). Outputs carry `rank` and
   `compression` columns; `--ranks` splits ranks across Slurm jobs. About 180
   fits per rank (15 grid × 9 + 45); time one rank before launching all.
 - Planner integration: `run_pusht_head_bank.py` (steps 6.2/6.3),
   `run_pusht_head_closed_loop.py` (step 6.4), `summarize_pusht_heads.py` (6.5).
 
-### PushT results so far (M2 Mac, MPS; generated files under `results/`, git-ignored)
-
-Data: 4096 train / 512 val / 800 test photos (512 / 64 / 100 targets × 8 agents).
-Heads: ranks 4, 16, 32, 128; 9 allocations × 3 resamples each, plus shuffled-label
-heads and random-projection / coordinate-subset controls. τ/lr chosen on val.
-
-**6.1 Photo level (test, no refitting).** Every learned head has AUROC 1.000
-(plain MSE 0.995). Sensitivity check passes: moving the T by 20 px raises a
-rank-32 head's distance to 2.4× the usual spread between photos of one target
-(plain MSE 0.33×; random/coordinate controls about the same as MSE). Rotating it
-20° gives 3.9× (MSE 0.65×).
-
-**6.2/6.3 Fixed bank, test (100 tasks, 64 candidates, 2 goal photos).**
-Week-4 gate passes. Regret in px against the best candidate in the bank:
-
-| | actual endpoints | predicted endpoints |
-|---|---:|---:|
-| plain MSE | 10.6 | 10.8 |
-| learned heads (all ranks/allocations) | 5.7 | 7.0 |
-| random projection | 13.4 | 13.3 |
-| coordinate subset | 12.2 | 11.8 |
-| shuffled-label heads | 35.7 | 36.4 |
-
-Rank 32, predicted endpoints: paired difference vs MSE −2.6 to −4.3 px per
-allocation; the 95% task-bootstrap CI excludes 0 for 8 of 9 (B1024 M256 K4:
-[−5.7, +0.4]). Swapping goal photo 0 for photo 1 changes the selected candidate
-in 26% of tasks with plain MSE and 4–12% with heads.
-
-**6.4 Closed loop, test (100 tasks × 2 goal photos, identical CEM noise/budget).**
-Done so far: plain MSE, rank-32 r0 of all 9 allocations, rank-32 random s0.
-Mean final T position error in px (paired vs MSE, 95% CI):
-
-| rank 32, r0 | K=2 | K=4 | K=8 |
-|---|---:|---:|---:|
-| B=64 | 19.5 (−13.7 [−18.4, −9.2]) | 19.5 (−13.7 [−18.3, −9.4]) | 20.7 (−12.5 [−17.1, −8.1]) |
-| B=256 | 36.9 (+3.7 [−2.1, 9.6]) | 19.5 (−13.7 [−18.4, −9.2]) | 20.6 (−12.6 [−17.2, −8.1]) |
-| B=1024 | 35.4 (+2.2 [−3.5, 8.1]) | 31.9 (−1.3 [−7.2, 4.5]) | 31.5 |
-
-Plain MSE 33.2 (success ≤20 px 0.47); good heads ≈ 0.63. Random rank-32
-projection 40.2, so the gain is not from compression alone. Every B=1024 head
-is near MSE; one untested possibility is that all allocations get the same 2000
-steps, so B=1024 sees each image fewer times. Only one resample per allocation
-so far; r1/r2 are queued.
-
-Remaining closed-loop queue (`code/configs/pusht_head_closed_loop_order.txt`):
-the rank-32 shuffled control, r1 and r2 of the 9 allocations, the remaining
-rank-32 controls, then the val-best allocation at ranks 4/16/128. About 55 min
-per head on the Mac; it runs overnight only:
-`caffeinate -dimsu bash code/scripts/run_pusht_head_closed_loop_night.sh`
-(resumable; skips finished heads).
-
-**MPS bug (fixed in `model.py`).** Upstream `encode` copies normalized proprio
-to the device with `non_blocking=True`; on MPS the temporary can be freed before
-the copy reads it, so the predictor got garbage proprio (up to 1e32) and
-predicted endpoints were wrong. Encoder features were unaffected, so head
-training and 6.1 are valid. The first bank run's predicted results were invalid
-and are kept in `results/pusht_head_bank_INVALID_mps_proprio_bug/`.
-`model.py` also loads DINOv2 from the local torch-hub cache, so a GitHub outage
-no longer blocks model loading.
+Results, figures and remaining work: [`pusht_linear_head.md`](pusht_linear_head.md).
 
 ## What we are building
 

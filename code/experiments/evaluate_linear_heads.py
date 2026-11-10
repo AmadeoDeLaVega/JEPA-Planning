@@ -32,6 +32,7 @@ from train_linear_head import evaluate, load_groups, write_csv  # noqa: E402
 
 
 def main() -> None:
+    """Score all saved heads and controls on the test groups and write ``test.csv``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runs", type=Path, nargs="+", required=True)
     parser.add_argument("--test", type=Path, required=True)
@@ -43,6 +44,8 @@ def main() -> None:
 
     started = perf_counter()
     test = load_groups(args.test, args.device)
+    # Plain MSE, every saved head (all ranks, allocations, resamples, shuffled) and the
+    # random / coordinate-subset controls. Nothing is refitted or retuned on test.
     catalog = lh.head_catalog(args.runs, dim=test["features"].shape[-1])
     rows = []
     for index, (info, head) in enumerate(catalog):

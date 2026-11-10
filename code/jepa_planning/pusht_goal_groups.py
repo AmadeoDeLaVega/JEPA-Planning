@@ -44,6 +44,7 @@ SPLIT_STREAM = {"train": 0, "val": 1, "test": 2}
 
 
 def validate_config(cfg: dict) -> None:
+    """Raise ``ValueError`` if the PushT goal-group config is missing fields or has bad values."""
     fields = {"seed", "num_targets", "agents_per_target", "target", "agent_bank", "pose_tolerance",
               "min_agent_clearance", "sensitivity"}
     if set(cfg) != fields:
@@ -78,8 +79,9 @@ def validate_config(cfg: dict) -> None:
 
 
 def bank_split_sizes(bank: dict) -> dict[str, int]:
+    """Number of bank agents per split; train gets the remainder after val/test rounding."""
     sizes = {split: int(round(bank["size"] * bank["fractions"][split])) for split in SPLITS[1:]}
-    sizes["train"] = bank["size"] - sum(sizes.values())
+    sizes["train"] = bank["size"] - sum(sizes.values())  # so the split sizes always sum to size
     return sizes
 
 
@@ -87,6 +89,8 @@ def agent_bank(cfg: dict) -> dict[str, np.ndarray]:
     """Absolute agent positions (px) per split: ``{split: [n, 2]}``, disjoint by construction."""
     bank = cfg["agent_bank"]
     rng = np.random.default_rng(np.random.SeedSequence([cfg["seed"], 0]))
+    # One draw for the whole bank, then consecutive slices per split: no agent
+    # position can appear in two splits.
     positions = rng.uniform(bank["low"], bank["high"], size=(bank["size"], 2))
     sizes = bank_split_sizes(bank)
     out, start = {}, 0
@@ -97,6 +101,9 @@ def agent_bank(cfg: dict) -> dict[str, np.ndarray]:
 
 
 def target_rng(cfg: dict, split: str, index: int) -> np.random.Generator:
+    """Seeded generator for target ``index`` of ``split`` (independent stream per split)."""
+    # Stream 1 = targets (stream 0 = agent bank, 2 = agent orders); target i of a split
+    # is reproducible on its own, which the bank script uses to rebuild targets.
     return np.random.default_rng(np.random.SeedSequence([cfg["seed"], 1, SPLIT_STREAM[split], index]))
 
 
@@ -110,7 +117,7 @@ def sample_target(env, rng: np.random.Generator, cfg: dict, action_mean: np.ndar
                   action_std: np.ndarray) -> np.ndarray:
     """Target pose ``[3]``: farthest endpoint of random chunks from a random start."""
     target = cfg["target"]
-    initial = sample_initial_state(rng)
+    initial = sample_initial_state(rng)  # first draw of the stream: also the planning task's start
     chunks = sample_action_chunks(rng, target["target_candidates"], target["horizon"],
                                   target["controls_per_chunk"], target["action_clip"])
     endpoints = []
@@ -118,9 +125,11 @@ def sample_target(env, rng: np.random.Generator, cfg: dict, action_mean: np.ndar
         env.reset_to_state = initial
         env.reset()
         for normalized_action in sequence.reshape(-1, 2):
+            # Chunks are sampled in the model's normalized action space; the env takes raw actions.
             _, _, _, info = env.step(normalized_action * action_std + action_mean)
         endpoints.append(np.asarray(info["state"][2:5], dtype=np.float32))
     endpoints = np.stack(endpoints)
+    # Farthest endpoint (combined position + angle error) = a reachable but non-trivial target.
     _, _, distance_from_start, _ = physical_errors(endpoints, initial[2:5])
     return endpoints[int(np.argmax(distance_from_start))]
 
@@ -131,6 +140,8 @@ def agent_clearance(agent: np.ndarray, object_pose: np.ndarray) -> float:
     dx, dy = float(agent[0]) - x, float(agent[1]) - y
     cos, sin = np.cos(angle), np.sin(angle)
     local_x, local_y = cos * dx + sin * dy, -sin * dx + cos * dy  # R(-angle) @ (agent - position)
+    # Distance from a point to an axis-aligned box: per axis, how far outside the
+    # box the point is (0 if inside); the T is the union of its two boxes.
     distance = min(
         np.hypot(max(x0 - local_x, 0.0, local_x - x1), max(y0 - local_y, 0.0, local_y - y1))
         for x0, x1, y0, y1 in T_RECTANGLES
@@ -149,7 +160,7 @@ def render_state(env, agent: np.ndarray, object_pose: np.ndarray, tolerance: dic
     if agent_clearance(agent, object_pose) < min_clearance:
         return None, "agent_on_object"
     env.reset_to_state = state_from(agent, object_pose)
-    observation, state = env.reset()
+    observation, state = env.reset()  # reset runs one physics step, which can push bodies apart
     state = np.asarray(state, dtype=np.float64)
     position, angle, _, _ = physical_errors(state[None, 2:5], np.asarray(object_pose, dtype=np.float64))
     if position[0] > tolerance["position"] or angle[0] > tolerance["angle"]:
@@ -181,10 +192,10 @@ def perturbed_poses(object_pose: np.ndarray, cfg: dict, rng: np.random.Generator
     for shift in cfg["sensitivity"]["shifts_px"]:
         direction = rng.uniform(0, 2 * np.pi)
         pose = np.array(object_pose, dtype=np.float64)
-        pose[:2] += shift * np.array([np.cos(direction), np.sin(direction)])
+        pose[:2] += shift * np.array([np.cos(direction), np.sin(direction)])  # exactly `shift` px away
         out.append(("shift_px", float(shift), pose))
     for degrees in cfg["sensitivity"]["rotations_deg"]:
         pose = np.array(object_pose, dtype=np.float64)
-        pose[2] = (pose[2] + rng.choice([-1, 1]) * np.deg2rad(degrees)) % (2 * np.pi)
+        pose[2] = (pose[2] + rng.choice([-1, 1]) * np.deg2rad(degrees)) % (2 * np.pi)  # random sign
         out.append(("rotation_deg", float(degrees), pose))
     return out

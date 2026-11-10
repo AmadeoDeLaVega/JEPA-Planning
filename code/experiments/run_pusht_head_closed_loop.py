@@ -44,6 +44,7 @@ from jepa_planning.pusht_multi_goal import cem_standard_normals  # noqa: E402
 
 
 def make_environment():
+    """jepa-wms PushT env as used by the checkpoint (224 px, target drawn, velocity proprio)."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
 
@@ -64,9 +65,11 @@ def cem_plan(model, observation: dict, goal: torch.Tensor, head: torch.Tensor, n
     std = np.ones_like(mean)
     best = float("nan")
     for iteration in range(cfg["cem_iterations"]):
+        # Shared standard normals scaled by the current distribution: the only thing that
+        # differs between heads is which samples become elites.
         actions = np.clip(mean[None] + std[None] * normals[iteration], -cfg["action_clip"], cfg["action_clip"])
         actions = actions.astype(np.float32)
-        actions[0] = mean
+        actions[0] = mean  # always evaluate the current mean itself
         costs = []
         for start in range(0, len(actions), cfg["batch_size"]):
             batch = torch.from_numpy(actions[start : start + cfg["batch_size"]]).permute(1, 0, 2).to(model.device)
@@ -74,19 +77,26 @@ def cem_plan(model, observation: dict, goal: torch.Tensor, head: torch.Tensor, n
             features = features.reshape(features.shape[0], -1, features.shape[-1]).float()
             costs.append(hp.head_costs(features, goal, head).cpu().numpy())
         costs = np.concatenate(costs)
-        elites = np.argsort(costs)[: cfg["cem_elites"]]
+        elites = np.argsort(costs)[: cfg["cem_elites"]]  # lowest terminal cost = closest to the goal
         mean, std = actions[elites].mean(axis=0), actions[elites].std(axis=0)
         best = float(costs[elites[0]])
-    return np.clip(mean[0], -cfg["action_clip"], cfg["action_clip"]), best
+    return np.clip(mean[0], -cfg["action_clip"], cfg["action_clip"]), best  # execute only the first chunk
 
 
 def run_head(env, model, head: torch.Tensor, tasks: dict, goals: torch.Tensor, cfg: dict) -> list[dict]:
+    """Run every (task, goal photo) episode with one head as the terminal cost.
+
+    Each episode restores the task's initial state and replans ``replans`` times,
+    executing one chunk per plan. CEM noise depends only on (seed, task group,
+    replan), so all heads see the same random numbers. Returns one row per episode.
+    """
     action_mean = model.preprocessor.action_mean.cpu().numpy()
     action_std = model.preprocessor.action_std.cpu().numpy()
     head = head.to(model.device)
     rows = []
     for task in range(len(tasks["target"])):
         target = tasks["target"][task]
+        # Metrics of the start state, so "ever succeeded" counts a task that starts solved.
         initial = {k: float(v[0]) for k, v in hp.physical_metrics(tasks["initial"][task][None, 2:5], target).items()}
         for photo in range(cfg["goal_photos"]):
             goal = goals[task, photo].to(model.device).float()
@@ -95,10 +105,12 @@ def run_head(env, model, head: torch.Tensor, tasks: dict, goals: torch.Tensor, c
             ever_native, ever_pose, best_combined = initial["native_success"], initial["pose_success"], initial["combined_error"]
             started = perf_counter()
             for replan in range(cfg["replans"]):
+                # Depends on (seed, task, replan) but not on the head or the photo: paired comparison.
                 normals = cem_standard_normals(cfg["seed"], int(tasks["group"][task]), replan, cfg["cem_iterations"],
                                                cfg["cem_samples"], cfg["cem_horizon"], model.action_dim)
                 action, _ = cem_plan(model, observation, goal, head, normals, cfg)
                 for normalized_action in action.reshape(cfg["controls_per_chunk"], 2):
+                    # The planner works in normalized actions; the env takes raw ones.
                     observation, _, _, info = env.step(normalized_action * action_std + action_mean)
                 step = {k: float(v[0]) for k, v in hp.physical_metrics(np.asarray(info["state"])[None, 2:5], target).items()}
                 ever_native = max(ever_native, step["native_success"])
@@ -114,6 +126,7 @@ def run_head(env, model, head: torch.Tensor, tasks: dict, goals: torch.Tensor, c
 
 
 def main() -> None:
+    """Load bank tasks and heads, then run the heads not yet done (resumable)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bank", type=Path, required=True, help="run_pusht_head_bank.py output with bank.npz")
     parser.add_argument("--runs", type=Path, nargs="*", default=[], help="train_linear_head.py outputs")
@@ -138,6 +151,7 @@ def main() -> None:
         tasks = {key: value[: args.tasks] for key, value in tasks.items()}
     features = torch.load(Path(bank_meta["groups"]) / "features.pt", map_location="cpu", weights_only=True)["groups"]
     photo_index = tasks["photo_index"][:, : cfg["goal_photos"]]
+    # goals[t, p] = encoder features of task t's goal photo p (same photos as the bank).
     goals = features[torch.from_numpy(photo_index.ravel())].reshape(*photo_index.shape, *features.shape[1:])
     catalog = {info["head"]: (info, head) for info, head in lh.head_catalog(args.runs)}
     missing = [name for name in args.heads if name not in catalog]
@@ -147,6 +161,7 @@ def main() -> None:
     (args.output / "episodes").mkdir(parents=True, exist_ok=True)
     meta_path = args.output / "metadata.json"
     metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {"invocations": []}
+    # A resumed run must not mix episodes planned under different settings.
     if metadata.get("config", cfg) != cfg or metadata.get("bank", str(args.bank)) != str(args.bank):
         raise ValueError("--resume must use the same config and bank")
     checkpoint = ROOT / "checkpoints/dino_wm_pusht.pth.tar"
@@ -170,6 +185,7 @@ def main() -> None:
             info, head = catalog[name]
             started = perf_counter()
             rows = [{**info, **row} for row in run_head(env, model, head, tasks, goals, cfg)]
+            # Write then rename, so a crash never leaves a half-written CSV that --resume would skip.
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))

@@ -38,13 +38,17 @@ PAIRED = {"bank": ["position_error", "regret", "native_success"],
 
 
 def iqm(values: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Interquartile mean along ``axis`` (mean of the middle 50% of sorted values)."""
     values = np.sort(values, axis=axis)
     n = values.shape[axis]
+    # Keep sorted positions [25%, 75%); max(..., low + 1) keeps at least one value for tiny n.
     low, high = int(np.floor(0.25 * n)), int(np.ceil(0.75 * n))
     return np.take(values, range(low, max(high, low + 1)), axis=axis).mean(axis=axis)
 
 
 def bootstrap(per_task: np.ndarray, draws: int, rng: np.random.Generator) -> dict[str, float]:
+    """Mean and IQM of per-task values with 95% percentile intervals from ``draws`` task resamples."""
+    # Each row of `index` is one bootstrap sample of tasks, drawn with replacement.
     index = rng.integers(0, len(per_task), size=(draws, len(per_task)))
     samples = per_task[index]
     means, iqms = samples.mean(axis=1), iqm(samples, axis=1)
@@ -56,6 +60,7 @@ def bootstrap(per_task: np.ndarray, draws: int, rng: np.random.Generator) -> dic
 def add_photo_changes(frame: pd.DataFrame) -> pd.DataFrame:
     """Per (source, head, task): did photo 0 and photo 1 select different candidates / native outcomes?"""
     keys = ["source", "head", "task"]
+    # One row per (source, head, task) with photo 0 and photo 1 side by side.
     pivot = frame.pivot_table(index=keys, columns="photo", values=["selected", "native_success"], aggfunc="first")
     changes = pd.DataFrame({
         "photo_selection_changed": (pivot["selected"][0] != pivot["selected"][1]).astype(float),
@@ -66,12 +71,19 @@ def add_photo_changes(frame: pd.DataFrame) -> pd.DataFrame:
 
 def summarize(frame: pd.DataFrame, metrics: list[str], paired: list[str], by: list[str], draws: int,
               seed: int) -> pd.DataFrame:
+    """One row per condition: bootstrap stats per metric and the paired difference to plain MSE.
+
+    Rows of one task (photos, resamples, control seeds) are averaged first, so
+    the bootstrap resamples whole tasks.
+    """
     rng = np.random.default_rng(seed)
     for column in CONDITION:
         if column not in frame:
             frame[column] = np.nan
+    # groupby drops NaN keys, so plain MSE / controls (no B, M, K) get the placeholder -1.
     frame[CONDITION[1:]] = frame[CONDITION[1:]].astype(float).fillna(-1)  # -1: not a fitted head
     keys = by + CONDITION
+    # Average photos, resamples and control seeds within a task first: the task is the unit.
     per_task = frame.groupby(keys + ["task"], dropna=False)[metrics].mean().reset_index()
     head_counts = frame.groupby(keys, dropna=False)["head"].nunique()
     rows = []
@@ -88,6 +100,7 @@ def summarize(frame: pd.DataFrame, metrics: list[str], paired: list[str], by: li
             stats = bootstrap(group[metric].to_numpy(), draws, rng)
             row.update({f"{metric}_{name}": value for name, value in stats.items()})
             if metric in paired and row["method"] != "plain_mse" and len(reference):
+                # Paired: same tasks, so task difficulty cancels in the difference.
                 difference = group[metric].to_numpy() - reference.loc[group["task"], metric].to_numpy()
                 stats = bootstrap(difference, draws, rng)
                 row.update({f"{metric}_vs_mse": stats["mean"], f"{metric}_vs_mse_lo": stats["mean_lo"],
@@ -97,6 +110,7 @@ def summarize(frame: pd.DataFrame, metrics: list[str], paired: list[str], by: li
 
 
 def main() -> None:
+    """Read records (bank) or episodes (closed loop), summarize, and write a CSV."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kind", choices=("bank", "closed-loop"), required=True)
     parser.add_argument("--input", type=Path, required=True)

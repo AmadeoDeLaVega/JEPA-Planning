@@ -31,6 +31,7 @@ def _offline_dinov2_hub():
     original = torch.hub.load
 
     def load(repo_or_dir, model, *args, **kwargs):
+        """``torch.hub.load`` that uses the cached DINOv2 checkout when available."""
         if repo_or_dir == "facebookresearch/dinov2" and cached.is_dir() and "source" not in kwargs:
             return original(str(cached), model, *args, source="local", **kwargs)
         return original(repo_or_dir, model, *args, **kwargs)
@@ -110,12 +111,14 @@ def _synchronous_proprio_copy(preprocessor, device: torch.device) -> None:
     normalize = preprocessor.normalize_proprios
 
     def normalize_on_device(proprio):
+        """Upstream normalization, then a synchronous copy to ``device``."""
         return normalize(proprio).to(device, dtype=torch.float32)
 
     preprocessor.normalize_proprios = normalize_on_device
 
 
 def _init_module(model_cfg, checkpoint, pretrain_cfg, data_cfg, device, stats, preprocessor):
+    """Call upstream ``init_module`` for the checkpoint (split out to wrap it in the hub patch)."""
     return importlib.import_module(model_cfg["module_name"]).init_module(
         folder=str(checkpoint.parent),
         checkpoint=checkpoint.name,

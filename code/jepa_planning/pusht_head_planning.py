@@ -29,11 +29,14 @@ from jepa_planning.pusht_multi_goal import angle_error
 
 POSITION_THRESHOLDS = (10.0, 20.0, 50.0)
 NATIVE_COVERAGE = 0.95
+# The T in its own frame, built from the same rectangles as the env's add_tee.
 _T_LOCAL = unary_union([sg.box(x0, y0, x1, y1) for x0, x1, y0, y1 in T_RECTANGLES])
 
 
 def t_polygon(pose: np.ndarray):
+    """Shapely polygon of the T at ``pose = (x, y, angle)`` in env pixels."""
     x, y, angle = (float(v) for v in pose)
+    # Rotate about the block's origin, then move it there: world = position + R(angle) @ local.
     rotated = sa.rotate(_T_LOCAL, angle, origin=(0, 0), use_radians=True)
     return sa.translate(rotated, x, y)
 
@@ -52,8 +55,9 @@ def physical_metrics(poses: np.ndarray, target: np.ndarray) -> dict[str, np.ndar
     out = {
         "position_error": position,
         "angle_error_deg": np.rad2deg(angle),
+        # 50 px per radian, the same weighting as the multi-goal experiments.
         "combined_error": np.sqrt(position**2 + (50.0 * angle) ** 2),
-        "pose_success": ((position < 20.0) & (angle < np.pi / 9)).astype(int),
+        "pose_success": ((position < 20.0) & (angle < np.pi / 9)).astype(int),  # 20 px and 20 degrees
         "coverage": np.array([coverage(pose, target) for pose in poses]),
     }
     out["native_success"] = (out["coverage"] >= NATIVE_COVERAGE).astype(int)
@@ -66,13 +70,14 @@ def selection_rows(costs: np.ndarray, metrics: dict[str, np.ndarray]) -> dict[st
     """Metrics of the min-cost candidate, plus Eq. 5 regret on position and on combined error."""
     selected = int(np.argmin(costs))
     row = {"selected": selected, **{name: float(values[selected]) for name, values in metrics.items()}}
+    # Eq. 5: error of the chosen candidate minus the best error available in the same set.
     row["regret"] = row["position_error"] - float(metrics["position_error"].min())
     row["combined_regret"] = row["combined_error"] - float(metrics["combined_error"].min())
-    row["oracle_native_available"] = int(metrics["native_success"].any())
+    row["oracle_native_available"] = int(metrics["native_success"].any())  # could any candidate succeed?
     return row
 
 
 def head_costs(candidates: torch.Tensor, goal: torch.Tensor, head: torch.Tensor) -> torch.Tensor:
     """Eq. 3 for candidates ``[N, P, D]`` and one goal ``[P, D]``; returns ``[N]``."""
     head = head.to(device=candidates.device, dtype=candidates.dtype)
-    return linear_goal_distance(candidates, goal[None].to(candidates), head)
+    return linear_goal_distance(candidates, goal[None].to(candidates), head)  # goal broadcast over N

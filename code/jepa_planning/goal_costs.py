@@ -141,5 +141,7 @@ def linear_goal_distance(
     if head.device != candidate_features.device or head.dtype != candidate_features.dtype:
         raise ValueError("head must match the feature device and dtype")
 
+    # [N, ..., D] @ [D, r] applies L to every patch; then sum over the r outputs
+    # and average over all patch dimensions.
     projected = (candidate_features - goal_features).matmul(head.transpose(0, 1))
     return projected.square().sum(dim=-1).flatten(start_dim=1).mean(dim=1)

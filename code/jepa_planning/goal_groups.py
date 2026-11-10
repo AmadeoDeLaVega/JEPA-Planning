@@ -29,6 +29,7 @@ SPLITS = ("train", "val", "test")
 
 
 def validate_config(cfg: dict) -> None:
+    """Raise ``ValueError`` if the goal-group config is missing fields or has bad values."""
     fields = {"seed", "warmup_steps", "goal_steps", "first_seed", "num_targets", "hands_per_target",
               "hand_bank", "min_hand_puck_distance", "max_reach_error"}
     if set(cfg) != fields:
@@ -53,13 +54,15 @@ def validate_config(cfg: dict) -> None:
 
 
 def target_seeds(cfg: dict, split: str) -> np.ndarray:
+    """Task seeds of one split (a contiguous, split-specific range)."""
     start = cfg["first_seed"][split]
     return np.arange(start, start + cfg["num_targets"][split])
 
 
 def bank_split_sizes(bank: dict) -> dict[str, int]:
+    """Number of bank hands per split; train gets the remainder after val/test rounding."""
     sizes = {split: int(round(bank["size"] * bank["fractions"][split])) for split in SPLITS[1:]}
-    sizes["train"] = bank["size"] - sum(sizes.values())
+    sizes["train"] = bank["size"] - sum(sizes.values())  # so the split sizes always sum to size
     return sizes
 
 
@@ -67,6 +70,7 @@ def hand_bank(cfg: dict) -> dict[str, np.ndarray]:
     """Absolute hand xy positions per split; ``{split: [n, 2]}``, disjoint by construction."""
     bank = cfg["hand_bank"]
     rng = np.random.default_rng(np.random.SeedSequence([cfg["seed"], 0]))
+    # One draw for the whole bank, then consecutive slices: no hand position is in two splits.
     positions = rng.uniform(bank["low"], bank["high"], size=(bank["size"], 2))
     sizes = bank_split_sizes(bank)
     out, start = {}, 0
@@ -107,10 +111,12 @@ def render_group(env, goal_snap: dict, goal_pose: np.ndarray, bank_xy: np.ndarra
         if np.linalg.norm(target_xy - goal_pose[:2]) < cfg["min_hand_puck_distance"]:
             rejected["near_puck"] += 1  # skip the simulation; the bank point itself is too close
             continue
-        mp.restore(env, goal_snap)
+        mp.restore(env, goal_snap)  # every photo starts from the same goal state
+        # Move the hand to the absolute bank position (xy only; height unchanged).
         offset = np.array([*(target_xy - mp.hand_pos(env)[:2]), 0.0])
         mp.move_hand_keep_puck(env, offset)
         hand = mp.hand_pos(env)
+        # Reject photos where moving the hand disturbed the puck or the goal is not met.
         if not np.array_equal(mp.puck_pose(env), goal_pose):
             rejected["puck_moved"] += 1
         elif np.linalg.norm(hand[:2] - target_xy) > cfg["max_reach_error"]:

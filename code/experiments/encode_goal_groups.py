@@ -34,11 +34,13 @@ def encode(model, visual: np.ndarray, proprio: np.ndarray, batch_size: int) -> t
         frames = torch.from_numpy(visual[start : start + batch_size]).permute(0, 3, 1, 2)[:, None]
         state = torch.from_numpy(proprio[start : start + batch_size]).float()[:, None]
         features = model.encode({"visual": frames, "proprio": state})["visual"][:, -1]
+        # [n, 1, 16, 16, 384] -> [n, 256 patches, 384]; fp16 halves the cache size.
         out.append(features.reshape(len(frames), -1, features.shape[-1]).half().cpu())
     return torch.cat(out)
 
 
 def main() -> None:
+    """Encode ``images.npz`` of a goal-group directory into ``features.pt``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--env", default="pusht", choices=["pusht", "metaworld"])
@@ -55,6 +57,7 @@ def main() -> None:
     started = perf_counter()
     model = load_world_model(args.env, args.device).requires_grad_(False).eval()
     payload = {}
+    # Goal photos always; moved-T sensitivity photos only exist for val/test.
     for key, name in [("groups", "images.npz"), ("sensitivity", "sensitivity.npz")]:
         if (args.directory / name).exists():
             data = np.load(args.directory / name)

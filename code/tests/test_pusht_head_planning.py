@@ -1,3 +1,5 @@
+"""Tests for PushT head-planning metrics: T polygon, coverage, physical metrics, selection rows, head costs."""
+
 import numpy as np
 import torch
 

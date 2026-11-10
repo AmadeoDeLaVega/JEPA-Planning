@@ -37,6 +37,7 @@ from jepa_planning import goal_groups as gg  # noqa: E402
 
 
 def main() -> None:
+    """Generate one split's Meta-World goal groups and write images + metadata."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", choices=gg.SPLITS, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "code/configs/goal_groups.yaml")
@@ -61,11 +62,11 @@ def main() -> None:
     rejected, short = Counter(), []
     started = perf_counter()
     for group, seed in enumerate(gg.target_seeds(cfg, args.split)):
-        goal_snap, goal_pose = gg.make_target(env, int(seed), cfg)
+        goal_snap, goal_pose = gg.make_target(env, int(seed), cfg)  # same construction as the baseline tasks
         order = gg.hand_order(cfg, int(seed), len(bank))
         photos, reasons = gg.render_group(env, goal_snap, goal_pose, bank, order, needed, cfg)
         rejected.update(reasons)
-        if len(photos) < needed:
+        if len(photos) < needed:  # bank exhausted before K hands were accepted
             short.append({"target_seed": int(seed), "accepted": len(photos)})
         for slot, photo in enumerate(photos):
             columns["frames"].append(photo["frame"])
