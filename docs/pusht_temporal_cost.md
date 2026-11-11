@@ -306,12 +306,50 @@ version tested beat MSE:
 - blended with MSE, in the probe or in closed loop.
 
 The analysis points to the training labels as the cause: they never compare
-branches. In `pusht_noise`, the only labels that could compare branches are
-object poses. That would train on what the probe grades and drop the idea of a
-temporal cost.
+branches. Object poses could compare branches directly, but that would train
+on what the probe grades and drop the idea of a temporal cost.
+
+The follow-up keeps transition data but changes the target from elapsed time to
+the fewest steps. A quasimetric cost, which obeys the triangle inequality,
+stitches recorded steps across episodes. See `docs/pusht_quasimetric_cost.md`.
 
 In closed loop the temporal cost alone was clearly worse. The blend was
 inconclusive and also behind multi-goal averaging.
+
+<!-- ## Figures
+
+The numbers behind these figures are in `results/tables/`, and
+`code/scripts/plot_results.py` redraws them. The overview figures compare every
+method in the project and will grow as new methods are added.
+
+**Every method on the evaluation seeds.** Each bar is a method's mean, and the
+color shows its family.
+
+![Mean results by method](../results/figures/overview/method_comparison.png)
+
+**Paired improvement over one-photo MSE**, with 95% intervals and the pass rule
+(interval above zero and at least 3 of 5 banks). Only multi-goal averaging passes.
+
+![Paired improvement over MSE](../results/figures/overview/paired_vs_mse.png)
+
+**Step counting on recorded episodes** (notebook step 2). Predictions follow the
+true gap on training episodes and run high on unseen validation episodes.
+
+![Predicted versus true gap](../results/figures/pusht_temporal_cost/step_counting.png)
+
+**Ranking candidates** (notebook steps 4, 8 and 9). Over all candidates the
+temporal costs are close to MSE. Among the 16 nearest the goal they fall well
+behind, on the probe and on real branching trajectories.
+
+![Rank correlation, all and nearest candidates](../results/figures/pusht_temporal_cost/ranking.png)
+
+![Rank correlation among the 16 nearest candidates](../results/figures/pusht_temporal_cost/near_goal_ranking.png)
+
+**The blend sweep on the dev banks** (notebook step 10). Each panel is one metric.
+λ = 0.5 had the lowest regret there, was frozen, and then failed on the
+evaluation seeds.
+
+![Dev-bank metrics against blend weight](../results/figures/pusht_temporal_cost/blend_sweep.png) -->
 
 ## Limitations
 

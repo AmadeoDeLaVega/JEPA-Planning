@@ -66,7 +66,15 @@ banks.
 
 The learned temporal cost replaces feature similarity with predicted steps to
 the goal, trained from trajectory frame gaps. See `docs/pusht_temporal_cost.md`
-for the motivation, method, commands, and results.
+for the motivation, method, commands, and results. It did not beat MSE. Its
+follow-up, a quasimetric cost that learns the fewest steps to the goal rather
+than elapsed time, is implemented but not yet trained. See
+`docs/pusht_quasimetric_cost.md`.
+
+Reported numbers for every method are kept as tidy tables in `results/tables/`
+(see its README), and `code/scripts/plot_results.py` draws the comparison figures
+in `results/figures/`. Add rows for a new method, task or dataset there and
+re-run the script.
 
 The closed-loop Meta-World Push baseline runs through
 `code/experiments/run_baseline.py`. Its protocol, commands, outputs, and tests

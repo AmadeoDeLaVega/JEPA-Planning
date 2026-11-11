@@ -25,7 +25,10 @@ checkpoints/
 
 # Generated experiment outputs
 artifacts/
-results/
+# Generated run outputs stay local; reported tables and their figures are tracked.
+results/*
+!results/tables/
+!results/figures/
 outputs/
 logs/
 wandb/
@@ -43,3 +46,6 @@ slurm-*.err
 !third_party/
 !third_party/jepa-wms/
 !third_party/jepa-wms/**
+
+# WIP to skip for now, figures not yet ready for push
+results/
