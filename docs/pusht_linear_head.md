@@ -1,10 +1,10 @@
-# PushT learned linear goal head: what was done and results so far
+# PushT learned linear goal head: what was done and results
 
-Status (2026-11-09): data, head training, the photo-level test and the fixed
-candidate bank are **complete**. The closed-loop evaluation is **partly done**:
-plain MSE, one resample of each of the 9 rank-32 allocations, and one
-random-projection control. The rest runs overnight on a Mac (see
-[Remaining work](#remaining-work)). The full plan is in
+Status (2026-11-17): data, head training, the photo-level test, the fixed
+candidate bank and the closed-loop evaluation are **complete**. The closed loop
+covers all 70 heads: plain MSE, 3 resamples of each of the 9 rank-32
+allocations, their shuffled-label heads, random-projection and coordinate-subset
+controls, and the val-best allocation at ranks 4/16/128. The full plan is in
 [`linear_head_plan.md`](linear_head_plan.md). PushT comes first, before the
 proposal's Meta-World Push.
 
@@ -99,34 +99,55 @@ decisions made from predicted features. It does.
 Compression barely matters for learned heads: rank 4 (96×) is as good as
 rank 128 (3×). Random projections get worse as they compress more.
 
-### 6.4 Closed loop: large gains at B ≤ 256, none yet at B = 1024
+### 6.4 Closed loop: the head beats MSE at every allocation but one; small budgets are best
 
 Paired CEM (4 replans × 2 iterations × 64 samples, 2-chunk horizon). Every
 cost uses the same start states, the same random numbers and the same budget;
-only the terminal cost changes. 100 test tasks × 2 goal photos per head.
+only the terminal cost changes. 100 test tasks × 2 goal photos per head, and
+3 resamples per allocation. Following the proposal, each task's rows (2 photos ×
+3 resamples) are averaged before the task bootstrap.
 
 ![Closed-loop final T error per allocation](figures/pusht_head_closed_loop.png)
 
-| Rank 32, resample r0 | K = 2 | K = 4 | K = 8 |
+| Rank 32, 3 resamples | K = 2 | K = 4 | K = 8 |
 |---|---:|---:|---:|
-| B = 64 | **19.5** (−13.7 [−18.4, −9.2]) | **19.5** (−13.7 [−18.3, −9.4]) | **20.7** (−12.5 [−17.1, −8.1]) |
-| B = 256 | 36.9 (+3.7 [−2.1, 9.6]) | **19.5** (−13.7 [−18.4, −9.2]) | **20.6** (−12.6 [−17.2, −8.1]) |
-| B = 1024 | 35.4 (+2.2 [−3.5, 8.1]) | 31.9 (−1.3 [−7.2, 4.5]) | 31.5 |
+| B = 64 | **19.6** (−13.5 [−18.3, −9.1]) | **19.8** (−13.3 [−17.9, −9.1]) | **20.9** (−12.3 [−16.8, −8.0]) |
+| B = 256 | 30.2 (−3.0 [−7.2, +1.3]) | **22.3** (−10.9 [−14.9, −6.9]) | **23.2** (−10.0 [−14.2, −6.0]) |
+| B = 1024 | **25.7** (−7.5 [−11.7, −3.4]) | 33.0 (−0.2 [−5.2, +4.8]) | **26.4** (−6.8 [−11.2, −2.3]) |
 
 Mean final T position error in px (paired difference vs plain MSE, 95% task
-bootstrap). Plain MSE: **33.2 px**, success within 20 px 0.47. The good heads
-reach about 0.63. Random rank-32 projection: 40.2 px.
+bootstrap). Plain MSE: **33.2 px**, success within 20 px 0.47. The B = 64
+heads reach 0.63.
 
-How to read this, with caution:
-- At B = 64 and most of B = 256, the head cuts final T error by ~40%, and the
-  intervals are well away from zero.
-- All three B = 1024 heads and B = 256 K = 2 are no better than MSE. The
-  fixed bank also ranked the B = 1024 heads worst, though they still beat MSE
-  there. One untested explanation: every allocation trains for the same 2000
-  steps, so B = 1024 sees each photo fewer times. Equal steps per allocation is
-  required by the proposal (Algorithm 1, step 3), so the main comparison keeps it.
-- **Each cell is a single fit.** The proposal asks for 3 resamples per
-  allocation. r1 and r2 are queued, so the M-vs-K question is still open.
+| Control / rank (paired vs MSE, px) | Mean error | Diff vs MSE [95% CI] | Success ≤ 20 px |
+|---|---:|---:|---:|
+| Random projection, rank 32 (3 seeds) | 38.1 | +4.9 [+1.8, +7.9] | 0.42 |
+| Coordinate subset, 32 dims (3 seeds) | 29.6 | −3.6 [−5.8, −1.5] | 0.50 |
+| Shuffled-label heads, rank 32 (27 heads) | 71–86 | +38 to +53 | 0.04–0.13 |
+| Learned head, rank 4 (B256 M64 K4) | 20.1 | −13.0 [−17.4, −8.8] | 0.64 |
+| Learned head, rank 16 (B256 M32 K8) | 20.9 | −12.3 [−16.9, −8.0] | 0.62 |
+| Learned head, rank 128 (B64 M8 K8) | 20.7 | −12.5 [−16.9, −8.3] | 0.62 |
+
+What the full run shows:
+- **The head helps in closed loop.** 7 of 9 rank-32 allocations beat plain MSE
+  with intervals that exclude 0. At B = 64 final T error drops by ~40%
+  (33.2 → ~20 px). The two exceptions (B256 K2, B1024 K4) are no worse than
+  MSE.
+- **The gain comes from what the head learned.** A random rank-32 projection
+  is *worse* than MSE, a 32-dimension coordinate subset is only slightly
+  better, and shuffled-label heads fail (71–86 px).
+- **Rank barely matters,** as in the fixed bank: ranks 4, 16, 32 and 128 all
+  land at 20–23 px.
+- **M vs K has no consistent answer on PushT.** At B = 64 all three splits are
+  equal. At B = 256, K ≥ 4 is better than K = 2 (more agent positions per pose).
+  At B = 1024 the order is not monotone in K (25.7 / 33.0 / 26.4).
+- **Larger budgets are worse and less stable.** The B = 64 resamples agree
+  closely (18.7–23.2 px per head), while B = 1024 heads range from 19.7 to
+  37.8 px. Equal training steps per allocation (proposal Algorithm 1, step 3)
+  mean B = 1024 sees each photo far fewer times. That is the leading but
+  untested explanation, so it does not change the main comparison.
+- Native PushT success (the env's own coverage threshold) is ~1% for every
+  cost, so the pixel-distance and pose measures above carry the comparison.
 
 ## From the proposal vs. our additions
 
@@ -148,17 +169,10 @@ reports, and Meta-World Push.
 
 ## Remaining work
 
-1. Closed loop, in this order (`configs/pusht_head_closed_loop_order.txt`):
-   rank-32 shuffled control, resamples r1/r2 of all 9 allocations, remaining
-   rank-32 controls, then the val-best allocation at ranks 4/16/128. That is 59
-   heads at ~55 min each on an M2. It runs overnight only:
-   `caffeinate -dimsu bash code/scripts/run_pusht_head_closed_loop_night.sh`
-   (resumable; finished heads are skipped). On a GPU cluster the heads can be
-   split across jobs with `--heads`.
-2. Check the B = 1024 result with a separate diagnostic, e.g. longer training
+1. Check the B = 1024 result with a separate diagnostic, e.g. longer training
    of those heads. The main comparison keeps equal steps for every allocation,
    as Algorithm 1 requires.
-3. Meta-World Push, the proposal's environment: the code exists
+2. Meta-World Push, the proposal's environment: the code exists
    (`goal_groups.py`, `make_goal_groups.py`) but has not yet run in the
    simulator.
 

@@ -103,7 +103,7 @@ def closed_loop(results: Path, out: Path) -> None:
     ax.set_xlabel("Mean final T position error (px), lower is better")
     ax.set_title("Closed loop, held-out PushT targets (rank-32 heads)", pad=18)
     fig.text(0.01, 0.01, f"100 test tasks × 2 goal photos per head; {'/'.join(map(str, resamples))} resample(s) "
-             "per allocation so far.\nWhiskers: 95% task-bootstrap interval. Gray line and band: plain MSE and its "
+             "per allocation, pooled.\nWhiskers: 95% task-bootstrap interval. Gray line and band: plain MSE and its "
              "interval.", fontsize=8, color=INK_2)
     fig.tight_layout(rect=(0, 0.07, 1, 1))
     fig.savefig(out / "pusht_head_closed_loop.png", dpi=160)
