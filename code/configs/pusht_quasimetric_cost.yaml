@@ -1,0 +1,14 @@
+# Quasimetric (minimum-step) goal cost trained on recorded PushT trajectories.
+seed: 20261201
+episodes: 18685
+frame_stride: 5
+horizon: 64.0         # model steps. Pushing distances apart fades beyond this
+slack: 0.25           # recorded steps may average about 1 + slack
+components: 32
+component_dim: 8
+width: 64
+hidden: 256
+batch_size: 128       # transitions and random pairs per step, each
+train_steps: 20000
+learning_rate: 0.0003
+encode_batch_size: 64
