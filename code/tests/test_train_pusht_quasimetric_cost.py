@@ -30,6 +30,14 @@ def test_default_config_is_valid(config):
     validate_config(config)
 
 
+def test_fast_multiplier_config_differs_only_in_the_multiplier_rate(config):
+    fast = yaml.safe_load((ROOT / "code/configs/pusht_quasimetric_cost_fast_multiplier.yaml").read_text())
+
+    validate_config(fast)
+    assert {k for k in config if config[k] != fast[k]} == {"multiplier_learning_rate"}
+    assert fast["multiplier_learning_rate"] == pytest.approx(10 * config["multiplier_learning_rate"])
+
+
 def test_unknown_config_field_is_rejected(config):
     with pytest.raises(ValueError):
         validate_config({**config, "typo": 1})
@@ -48,6 +56,8 @@ def test_unknown_config_field_is_rejected(config):
         ("slack", 0.0),
         ("slack", float("nan")),
         ("learning_rate", 0),
+        ("multiplier_learning_rate", 0),
+        ("multiplier_learning_rate", float("nan")),
         ("seed", 2**32),
     ],
 )
@@ -130,7 +140,8 @@ def test_validation_scores_a_cost_that_counts_steps_exactly():
 
     scores = validate(FrameGap(), cache, counts, validation_samples(counts, seed=0), torch.device("cpu"), chunk=64)
 
-    assert scores == {"val_step_distance": 1.0, "val_violation": 0.0, "val_gap_ratio": 1.0, "val_order_accuracy": 1.0}
+    assert scores == {"val_step_distance": 1.0, "val_step_p10": 1.0, "val_step_p50": 1.0, "val_step_p90": 1.0,
+                      "val_violation": 0.0, "val_gap_ratio": 1.0, "val_order_accuracy": 1.0}
 
 
 @pytest.fixture
@@ -163,3 +174,18 @@ def test_train_updates_the_cost_and_logs_its_progress(toy, config):
     assert {"push", "violation", "multiplier", "val_gap_ratio", "val_order_accuracy"} <= history[0].keys()
     assert np.isfinite([row["train_loss"] for row in history]).all()
     assert not torch.equal(before, cost.encoder[0].weight)
+
+
+def test_train_saves_a_checkpoint_at_every_logged_step(toy, config, tmp_path):
+    cost, cache = toy
+    config.update(train_steps=40, batch_size=4)
+    counts = np.array([6, 6])
+
+    history = train(cost, cache, counts, cache, counts, config, torch.device("cpu"), checkpoints=tmp_path / "checkpoints")
+
+    saved = sorted((tmp_path / "checkpoints").glob("step_*.pt"))
+    assert [path.name for path in saved] == [f"step_{row['step']:05d}.pt" for row in history]
+    last = torch.load(saved[-1], weights_only=True)
+    assert last["step"] == 40 and last["kind"] == "quasimetric"
+    for name, tensor in cost.state_dict().items():
+        torch.testing.assert_close(last["state_dict"][name], tensor)

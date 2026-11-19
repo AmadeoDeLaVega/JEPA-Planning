@@ -68,7 +68,8 @@ The learned temporal cost replaces feature similarity with predicted steps to
 the goal, trained from trajectory frame gaps. See `docs/pusht_temporal_cost.md`
 for the motivation, method, commands, and results. It did not beat MSE. Its
 follow-up, a quasimetric cost that learns the fewest steps to the goal rather
-than elapsed time, is implemented but not yet trained. See
+than elapsed time, did not compare branching candidates any better in its first
+run, though its blend with MSE improved regret on the dev banks. See
 `docs/pusht_quasimetric_cost.md`.
 
 Reported numbers for every method are kept as tidy tables in `results/tables/`

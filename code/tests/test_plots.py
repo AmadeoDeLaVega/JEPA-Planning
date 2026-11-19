@@ -5,6 +5,9 @@ import pytest
 
 pytest.importorskip("seaborn")
 
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
 from jepa_planning import ROOT, plots  # noqa: E402
 
 TABLES = ROOT / "results/tables"

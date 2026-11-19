@@ -16,12 +16,9 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import pandas as pd  # noqa: E402
-import seaborn as sns  # noqa: E402
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 
 INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 
@@ -33,6 +30,7 @@ FAMILIES = {
     "Learned head (L)": "#eda100",
     "Disagreement-weighted": "#e87ba4",
     "Final-layer adaptation": "#008300",
+    "Quasimetric cost": "#6250d6",
 }
 # Method id (as in the tables) -> (label, family). Table order follows this order.
 METHODS = {
@@ -43,6 +41,8 @@ METHODS = {
     "temporal": ("Temporal", "Temporal cost"),
     "temporal_ordering": ("Temporal + ordering loss", "Temporal cost"),
     "blend_0.5": ("Blend with MSE, λ = 0.5", "Temporal cost"),
+    "quasimetric": ("Quasimetric", "Quasimetric cost"),
+    "blend_quasi_0.2": ("Quasimetric blend, λ = 0.2", "Quasimetric cost"),
 }
 # Metric id -> (label, lower is better).
 METRICS = {

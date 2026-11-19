@@ -1,7 +1,10 @@
 # Minimum-step (quasimetric) goal cost on PushT
 
-**Status:** the head, the training objective, the training script and unit tests
-have been built. Training has not been run yet.
+**Status:** trained once (`results/pusht_quasimetric_cost/seed_20261201`, commit
+`f121655`) and analysed on the dev banks and branching copies in
+`code/debug/temporal_cost.ipynb`. It failed the branching check, so by the plan
+below it stops here. Its λ = 0.2 blend with MSE is the strongest dev result on the
+branch, but nothing has been run on the evaluation seeds.
 
 ## Why
 
@@ -73,10 +76,12 @@ states close together. Whether that happens is the first thing to check.
   goal in the same space. `TemporalCost` used separate projections so it could
   discount the agent in the goal photo. This cost counts the steps to reach the
   photo's full state, agent included, which should add a few steps at most.
-  Photo agreement on the probe measures whether that matters.
-- Steps run about 1.25, not 1. The slack lets the average step slightly
+  Photo agreement on the probe measures whether that matters. (Observed: it
+  ignores the photo's agent almost entirely; see Results.)
+- Steps should run about 1.25, not 1. The slack lets the average step slightly
   exceed one, so all distances are inflated by about the same factor. Rankings,
-  which are all the planner uses, are unaffected.
+  which are all the planner uses, are unaffected. (Observed: about 1.6, because
+  the step rule never fully held; see Results.)
 - Distances start near 0.01. The push term must grow the latent scale early
   in training. Watch this in the first validation rows.
 
@@ -87,7 +92,9 @@ cache as the temporal cost (`code/configs/pusht_quasimetric_cost.yaml`; same
 seed, episodes, frame stride, network width, batch size, steps and learning
 rate). Each step draws 128 recorded transitions and 128 random frame pairs.
 
-Check the pipeline first, then train:
+Check the pipeline first, then train. On the RTX 5070 Ti use
+`~/jepa-venv-cu128/bin/python` instead of `.venv/bin/python`
+(`docs/reproduction.md`):
 
 ```bash
 .venv/bin/python code/experiments/train_pusht_quasimetric_cost.py \
@@ -148,10 +155,11 @@ perfectly, and a short training loop on a toy cache. Run both files with:
   code/tests/test_train_pusht_quasimetric_cost.py -q
 ```
 
-## Planned evaluation
+## Evaluation plan
 
 Same data, frozen model and protocol as the temporal and multi-goal studies, in
-this order:
+this order. Steps 1 and 2 are done (Results); step 2 triggered the stop rule, so
+steps 3 and 4 have not been run.
 
 1. Train on the `pusht_noise` training split and validate on the
    validation split. Check that steps stay near one and that `d(s, g)` stays at
@@ -164,3 +172,124 @@ this order:
 4. One frozen run on the evaluation seeds: probe 20261008–12 and closed loop
    20261108–12. The pass rule is written down beforehand, the same as before: an
    interval above zero and at least 3 of 5 banks favoring the new cost over MSE.
+
+## Results
+
+One model, `seed_20261201`: 20,000 steps on all 18,685 training episodes, 5.6 hours
+on the RTX 5070 Ti. All numbers come from `code/debug/temporal_cost.ipynb` (dev banks
+20261301–03 and training scenes only) and are in `results/tables/`. Intervals are
+95% hierarchical bootstraps over banks (or scenes), then tasks.
+
+### Training: the step rule never fully held
+
+| Step | Step length, validation (target 1 to 1.25) | Multiplier | Distance ÷ recorded gap | Next frame scored closer |
+|---|---|---|---|---|
+| 1,000 | 2.70 | 0.84 | 1.52 | 0.64 |
+| 5,000 | 1.93 | 1.53 | 1.06 | 0.70 |
+| 10,000 | 2.02 | 2.56 | 1.20 | 0.73 |
+| 20,000 | 1.62 | 4.74 | 0.93 | 0.74 |
+
+The multiplier shares the network's learning rate (3e-4) and rose too slowly, so
+recorded steps still cost about 1.6 at the end, ranging from 0.5 to 3. Unequal
+step costs loosen the shortest-path property this cost depends on. It does find
+routes shorter than the recordings (distance ÷ gap 0.93 while a step costs 1.6).
+
+### Ordering along recordings
+
+Frames *k* steps nearer the same goal scored lower, 21 validation episodes:
+
+| | MSE | Temporal | Quasimetric |
+|---|---|---|---|
+| 1 step apart | 0.69 | **0.80** | 0.75 |
+| 2 steps apart | 0.75 | **0.86** | 0.79 |
+| 4 steps apart | 0.80 | **0.91** | 0.83 |
+
+The temporal cost is trained on exactly this and wins.
+
+### Branching check: fails the stop rule
+
+216 tasks over 8 training scenes: candidates are 100 copies of a scene at time
+*t*, the goal is one copy's frame at *t + g*, graded by T error.
+
+| | MSE | Temporal | Temporal + ordering loss | Quasimetric |
+|---|---|---|---|---|
+| Regret | **2.21** | 4.77 | 4.59 | 5.32 |
+| Rank correlation, all | **0.46** | 0.41 | 0.39 | 0.36 |
+| Rank correlation, 16 nearest | **0.32** | 0.10 | 0.15 | 0.10 |
+
+Against the temporal cost on the 16 nearest: +0.003 [−0.081, +0.084], 4 of 8
+scenes. It does not beat the temporal cost, so the plan's stop rule applies.
+
+### Probe on the dev banks
+
+| | MSE | Temporal | Quasimetric | Quasimetric vs temporal |
+|---|---|---|---|---|
+| Regret | **7.30** | 10.41 | 10.54 | −0.13 [−3.99, +3.12], 1 of 3 |
+| Success | **0.81** | 0.64 | 0.74 | +0.10 [−0.02, +0.21], 3 of 3 |
+| Rank correlation, 16 nearest | **0.68** | 0.49 | 0.49 | +0.00 [−0.13, +0.12], 2 of 3 |
+| Photo agreement | 0.69 | 0.57 | **0.77** | +0.19 [+0.10, +0.28], 3 of 3 |
+| `agent_weight` | 0.35 | 0.20 | **−0.01** | |
+
+- **It ignores the agent in the goal photo.** The fit of cost on T error and
+  agent distance gives `agent_weight` ≈ 0 in all three banks, the opposite of what
+  the shared encoder suggested. That is why photo agreement beats MSE's: the
+  photos differ only in the agent. It still follows the T less than MSE
+  (`t_weight` 0.56 vs 0.65).
+- **It cannot use an agent-matched photo.** With the goal photo's agent placed at
+  the best candidate's agent, MSE's regret drops from 7.3 to 1.5 and the temporal
+  cost's to 5.1; the quasimetric cost stays at 10.5.
+- **Predicted features are not the main problem.** Scoring encoded true frames
+  instead lowers its regret to 8.8, still far behind MSE's 3.9.
+
+### Blend with MSE
+
+$(1 - \lambda)\, z(\text{MSE}) + \lambda\, z(\text{quasimetric})$, standardized per goal photo:
+
+| λ | 0 (MSE) | 0.1 | 0.2 | 0.3 | 0.5 | 0.7 | 1 (quasimetric) |
+|---|---|---|---|---|---|---|---|
+| Regret | 7.30 | 6.22 | **5.33** | 5.75 | 6.60 | 8.03 | 10.54 |
+| Success | 0.81 | 0.82 | **0.84** | 0.82 | 0.82 | 0.81 | 0.74 |
+| Photo agreement | 0.69 | 0.71 | 0.71 | 0.74 | 0.77 | **0.78** | 0.77 |
+
+At λ = 0.2, regret improves on MSE by 1.96 [0.40, 4.11], better in 3 of 3
+banks, with success also better in 3 of 3. It is the first dev result on this
+branch with an interval above zero. But λ is the best of five values on three
+banks, and the temporal blend (λ = 0.5: +1.68 [−0.25, +4.41] on these banks)
+failed on the evaluation seeds.
+
+## Conclusion
+
+Targeting the fewest steps instead of elapsed time did not fix branch
+comparison in this run: on real branching trajectories the quasimetric cost ranks
+the nearest candidates no better than the temporal cost, and both trail MSE. It
+did change one thing. It ignores the agent in the goal photo, which raises photo
+agreement and success over the temporal cost, but loses the agent-matched case.
+
+Two things remain open:
+
+1. **The step rule.** Recorded steps cost about 1.6, not 1, so the shortest-path
+   property was never really in place, and the branching check is not yet a
+   fair test of the idea. A retrain with a faster multiplier (its own learning
+   rate, or a higher start) can reuse the feature cache.
+2. **The λ = 0.2 blend.** It would need a frozen, one-time run on the evaluation
+   seeds, with the pass rule written down first.
+
+<!-- ## Figures
+
+`code/scripts/plot_results.py` draws these from `results/tables/`.
+
+**Training curves.** The step length never reaches the target band.
+
+![Quasimetric training curves](../results/figures/pusht_quasimetric_cost/training.png)
+
+**Every method on the dev banks and branching copies.**
+
+![Dev-bank comparison](../results/figures/overview/method_comparison_dev.png)
+
+**Ranking candidates** on the probe and on branching copies.
+
+![Rank correlation, all and nearest candidates](../results/figures/pusht_temporal_cost/ranking.png)
+
+**The blend sweep**, for all three learned costs.
+
+![Dev-bank metrics against blend weight](../results/figures/pusht_temporal_cost/blend_sweep.png) -->

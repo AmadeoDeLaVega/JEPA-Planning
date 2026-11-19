@@ -11,4 +11,5 @@ hidden: 256
 batch_size: 128       # transitions and random pairs per step, each
 train_steps: 20000
 learning_rate: 0.0003
+multiplier_learning_rate: 0.0003  # first run: same as the network, which proved too slow
 encode_batch_size: 64

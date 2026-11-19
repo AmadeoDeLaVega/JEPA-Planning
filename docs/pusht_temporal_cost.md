@@ -311,7 +311,12 @@ on what the probe grades and drop the idea of a temporal cost.
 
 The follow-up keeps transition data but changes the target from elapsed time to
 the fewest steps. A quasimetric cost, which obeys the triangle inequality,
-stitches recorded steps across episodes. See `docs/pusht_quasimetric_cost.md`.
+stitches recorded steps across episodes. In its first run it did not compare
+branches any better (rank correlation among the 16 nearest branching candidates
+0.10, the same as the temporal cost), although it ignores the goal photo's agent
+and its λ = 0.2 blend with MSE improved dev-bank regret. Its step rule never
+fully held, so the idea is not yet fairly tested. See
+`docs/pusht_quasimetric_cost.md`.
 
 In closed loop the temporal cost alone was clearly worse. The blend was
 inconclusive and also behind multi-goal averaging.
@@ -339,15 +344,17 @@ true gap on training episodes and run high on unseen validation episodes.
 
 **Ranking candidates** (notebook steps 4, 8 and 9). Over all candidates the
 temporal costs are close to MSE. Among the 16 nearest the goal they fall well
-behind, on the probe and on real branching trajectories.
+behind, on the probe and on real branching trajectories. The quasimetric cost
+(violet) does no better.
 
 ![Rank correlation, all and nearest candidates](../results/figures/pusht_temporal_cost/ranking.png)
 
 ![Rank correlation among the 16 nearest candidates](../results/figures/pusht_temporal_cost/near_goal_ranking.png)
 
 **The blend sweep on the dev banks** (notebook step 10). Each panel is one metric.
-λ = 0.5 had the lowest regret there, was frozen, and then failed on the
-evaluation seeds.
+For the temporal cost λ = 0.5 had the lowest regret there, was frozen, and then
+failed on the evaluation seeds. The quasimetric blend is best at λ = 0.2 and has
+not been run on the evaluation seeds.
 
 ![Dev-bank metrics against blend weight](../results/figures/pusht_temporal_cost/blend_sweep.png) -->
 

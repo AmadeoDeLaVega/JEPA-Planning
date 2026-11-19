@@ -67,9 +67,10 @@ CONFIG_FIELDS = {
     "batch_size",
     "train_steps",
     "learning_rate",
+    "multiplier_learning_rate",
     "encode_batch_size",
 }
-INTEGER_FIELDS = CONFIG_FIELDS - {"seed", "horizon", "slack", "learning_rate"}
+INTEGER_FIELDS = CONFIG_FIELDS - {"seed", "horizon", "slack", "learning_rate", "multiplier_learning_rate"}
 
 
 def validate_config(config: dict) -> None:
@@ -85,8 +86,9 @@ def validate_config(config: dict) -> None:
         raise ValueError("horizon must be finite and exceed one step")
     if not math.isfinite(config["slack"]) or config["slack"] <= 0:
         raise ValueError("slack must be finite and positive")
-    if not math.isfinite(config["learning_rate"]) or config["learning_rate"] <= 0:
-        raise ValueError("learning_rate must be finite and positive")
+    for field in ("learning_rate", "multiplier_learning_rate"):
+        if not math.isfinite(config[field]) or config[field] <= 0:
+            raise ValueError(f"{field} must be finite and positive")
 
 
 def build_cost(config: dict) -> QuasimetricCost:
@@ -150,7 +152,9 @@ def validate(cost: QuasimetricCost, cache, counts, samples: dict, device, chunk:
     """Check the step rule and the recorded-gap bound on unseen episodes.
 
     - ``val_step_distance`` and ``val_violation``: recorded steps should cost
-      about one, as on training episodes.
+      about one, as on training episodes. ``val_step_p10/p50/p90`` show the
+      spread, which the mean hides: every step should be near one, not just
+      the average.
     - ``val_gap_ratio``: mean distance over recorded gap for same-episode pairs.
       With every step near one it should be at most about ``1 + slack``; below
       one means the cost found shorter routes than the recording took.
@@ -169,23 +173,34 @@ def validate(cost: QuasimetricCost, cache, counts, samples: dict, device, chunk:
     to_goal = distances(starts, goals)
     ordered, closer = one_step_closer(starts, goals, counts)
     nearer = distances(closer, goals[ordered])
+    p10, p50, p90 = torch.quantile(step.float(), torch.tensor([0.1, 0.5, 0.9], device=step.device)).tolist()
     return {
         "val_step_distance": step.mean().item(),
+        "val_step_p10": p10,
+        "val_step_p50": p50,
+        "val_step_p90": p90,
         "val_violation": torch.nn.functional.relu(step - 1).square().mean().item(),
         "val_gap_ratio": (to_goal.cpu() / torch.from_numpy(gaps)).mean().item(),
         "val_order_accuracy": (nearer < to_goal[ordered]).float().mean().item(),
     }
 
 
-def train(cost: QuasimetricCost, cache, counts, val_cache, val_counts, config: dict, device) -> list[dict]:
-    """Fit the cost and return periodic training and validation numbers."""
+def train(cost: QuasimetricCost, cache, counts, val_cache, val_counts, config: dict, device,
+          checkpoints: Path | None = None) -> list[dict]:
+    """Fit the cost and return periodic training and validation numbers.
+
+    With ``checkpoints``, the weights at every logged step are saved there as
+    ``step_NNNNN.pt``, so states before an overshoot can still be analysed.
+    """
     rng = np.random.default_rng(config["seed"])
     samples = validation_samples(val_counts, config["seed"] + 1)
     objective = QuasimetricObjective(config["horizon"], config["slack"]).to(device)
-    # The multiplier gets no weight decay, which would bias it toward zero.
+    # The multiplier has its own learning rate: under Adam its raw value moves by
+    # about that much per step, so a small one caps how fast the step rule can be
+    # enforced. It gets no weight decay, which would bias it toward zero.
     optimizer = torch.optim.AdamW([
         {"params": cost.parameters()},
-        {"params": objective.parameters(), "weight_decay": 0.0},
+        {"params": objective.parameters(), "weight_decay": 0.0, "lr": config["multiplier_learning_rate"]},
     ], lr=config["learning_rate"])
     history = []
     for step in range(1, config["train_steps"] + 1):
@@ -200,6 +215,10 @@ def train(cost: QuasimetricCost, cache, counts, val_cache, val_counts, config: d
             row.update(validate(cost, val_cache, val_counts, samples, device))
             history.append(row)
             print(json.dumps(row), flush=True)
+            if checkpoints is not None:
+                checkpoints.mkdir(exist_ok=True)
+                torch.save({"kind": "quasimetric", "state_dict": cost.state_dict(), "config": config, "step": step},
+                           checkpoints / f"step_{step:05d}.pt")
     return history
 
 
@@ -242,7 +261,7 @@ def main() -> None:
     model.clear()
 
     cost = build_cost(config).to(device)
-    history = train(cost, cache, counts, val_cache, val_counts, config, device)
+    history = train(cost, cache, counts, val_cache, val_counts, config, device, checkpoints=args.output / "checkpoints")
     torch.save({"kind": "quasimetric", "state_dict": cost.state_dict(), "config": config},
                args.output / "quasimetric_cost.pt")
     if args.cache is None:
