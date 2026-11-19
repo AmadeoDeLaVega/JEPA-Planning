@@ -56,6 +56,11 @@ METRICS = {
 }
 TASKS = {"pusht": "PushT", "metaworld_push": "Meta-World Push"}
 EVALUATIONS = {"probe": "Fixed-bank probe", "closed_loop": "Closed-loop CEM", "branching": "Branching copies"}
+# Split -> figure title. Only eval rows support claims; dev rows are for tuning.
+SPLITS = {
+    "eval": "Evaluation seeds: each method frozen, then run once. Methods tried only on dev banks are not shown",
+    "dev": "Dev banks and training scenes: used for tuning, so not evidence on their own",
+}
 
 
 def use_style() -> None:
@@ -148,6 +153,7 @@ def method_comparison(table: pd.DataFrame, panels: list[tuple[str, str]], split:
             axis.set_ylabel(METRICS[metric][0])
             axis.set_title(f"{TASKS[task]}: {EVALUATIONS[evaluation]}\n{metric_title(metric)}", fontsize=10)
     _family_legend(figure, set(table.family))
+    figure.suptitle(SPLITS[split], x=0.01, ha="left", fontweight="bold")
     figure.tight_layout()
     return figure
 

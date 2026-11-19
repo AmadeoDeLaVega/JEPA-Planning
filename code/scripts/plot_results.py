@@ -146,29 +146,45 @@ def blend_sweep():
 
 
 def quasimetric_training():
-    """Training curves of the quasimetric cost, one line per run."""
+    """Training curves of every quasimetric run, on validation episodes unless noted."""
     table = pd.read_csv(TABLES / "pusht_quasimetric_cost/training.csv")
+    slack = 0.25
     panels = [
-        ("val_step_distance", "Step length, validation", (1.0, 1.25)),
-        ("multiplier", "Multiplier on the step rule", None),
-        ("val_gap_ratio", "Distance ÷ recorded gap, validation", None),
-        ("val_order_accuracy", "Next frame scored closer, validation", None),
+        ("val_step_distance", "Mean recorded-step cost", (1.0, 1 + slack), False),
+        ("val_step_p90", "90th-percentile recorded-step cost", (1.0, 1 + slack), False),
+        ("val_violation", "Step-rule violation (log scale)", None, True),
+        ("multiplier", "Multiplier on the step rule", None, False),
+        ("val_gap_ratio", "Distance ÷ recorded gap", None, False),
+        ("val_order_accuracy", "Next frame scored closer", None, False),
     ]
-    runs = sorted(table.run.unique())
-    shades = dict(zip(runs, ["#6250d6", "#9085e9", "#3f2fa8"]))  # violet steps, one per run
-    figure, axes = plt.subplots(1, 4, figsize=(16, 3.8))
-    for axis, (column, title, band) in zip(axes, panels):
+    runs = list(dict.fromkeys(table.run))  # in table order: first run, then later ones
+    styles = [{"color": "#9085e9", "linestyle": "--"}, {"color": "#6250d6", "linestyle": "-"},
+              {"color": "#3f2fa8", "linestyle": ":"}]  # violet steps, one per run
+    figure, axes = plt.subplots(2, 3, figsize=(15, 7.5))
+    for axis, (column, title, band, log) in zip(axes.flat, panels):
         if band:
-            axis.axhspan(*band, color=plots.GRID, label="target (1 to 1 + slack)")
-        for run in runs:
-            data = table[table.run == run]
-            axis.plot(data.step, data[column], marker="o", linewidth=2, color=shades[run], label=run)
+            axis.axhspan(*band, color=plots.GRID, label="target, 1 to 1 + slack")
+        if column == "val_violation":
+            axis.axhline(slack**2, color=plots.INK, linestyle=":", linewidth=1.2, label="limit, slack² = 0.0625")
+        if column == "val_order_accuracy":
+            axis.axhline(0.804, color=plots.FAMILIES["Temporal cost"], linestyle="--", linewidth=1.5,
+                         label="temporal cost")
+        for run, style in zip(runs, styles):
+            data = table[(table.run == run) & table[column].notna()]
+            if not data.empty:
+                axis.plot(data.step, data[column], marker="o", markersize=4, linewidth=2, label=run, **style)
+        if log:
+            axis.set_yscale("log")
         axis.set_title(title, fontsize=10)
         axis.set_xlabel("Training step")
-    axes[3].axhline(0.804, color=plots.FAMILIES["Temporal cost"], linestyle="--", linewidth=1.5, label="temporal cost")
-    for axis in axes[[0, 3]]:
-        axis.legend(loc="best")
-    figure.suptitle("Quasimetric cost training: the step rule never fully held", x=0.01, ha="left", fontweight="bold")
+    handles, labels = {}, {}
+    for axis in axes.flat:
+        for handle, label in zip(*axis.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    figure.legend(handles.values(), handles.keys(), loc="lower center", ncol=len(handles), bbox_to_anchor=(0.5, -0.04))
+    last = table.groupby("run").step.max()
+    note = ", ".join(f"{run}: to step {last[run]:,}" for run in runs)
+    figure.suptitle(f"Quasimetric cost training, validation episodes ({note})", x=0.01, ha="left", fontweight="bold")
     figure.tight_layout()
     return figure
 

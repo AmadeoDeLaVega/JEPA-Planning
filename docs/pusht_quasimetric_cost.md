@@ -114,10 +114,18 @@ Check the pipeline first, then train. On the RTX 5070 Ti use
   cache used, and the history. Output directories must be new.
 - **The final weights are saved.** Validation is logged but does not pick a
   checkpoint, since the temporal study showed step counting along recordings
-  does not predict planning.
+  does not predict planning. The weights at every logged step are also kept in
+  `checkpoints/`, so earlier states can still be analysed if the multiplier
+  overshoots.
+- **The multiplier has its own learning rate** (`multiplier_learning_rate`).
+  Under Adam its raw value moves by about that much per step. The first run used
+  the network rate, 3e-4, which proved too slow (Results). The retrain,
+  `code/configs/pusht_quasimetric_cost_fast_multiplier.yaml`, uses 3e-3 and
+  changes nothing else.
 - **Validation** uses 4,096 fixed transitions and same-episode pairs (gaps up
   to 24) from the validation split:
-  - `val_step_distance` should be about one;
+  - `val_step_distance` should be about one, and `val_step_p10/p50/p90`
+    show whether every step is, not just the average;
   - `val_gap_ratio`, distance over recorded gap, should be at most about
     `1 + slack`, and below one where the cost found shorter routes;
   - `val_order_accuracy` is how often the next recorded frame scores nearer
