@@ -1,0 +1,27 @@
+# PushT goal-image groups for the linear goal head (docs/linear_head_plan.md).
+seed: 20261105
+num_targets:        # train pool covers every allocation (M up to 512)
+  train: 512
+  val: 64
+  test: 100
+agents_per_target:  # train pool covers K up to 8
+  train: 8
+  val: 8
+  test: 8
+target:             # same construction as configs/pusht_multi_goal_closed_loop.yaml
+  target_candidates: 128
+  horizon: 2
+  controls_per_chunk: 5
+  action_clip: 2.0
+agent_bank:         # absolute agent positions in px, as the multi-goal goal photos
+  size: 64
+  fractions: {train: 0.5, val: 0.25, test: 0.25}
+  low: 45.0
+  high: 467.0
+pose_tolerance:     # accept a photo only if reset left object and agent here
+  position: 0.5     # px
+  angle: 0.005      # rad
+min_agent_clearance: 5.0  # px between agent disc and T; closer photos are rejected
+sensitivity:        # extra val/test photos with the object slightly moved
+  shifts_px: [5, 10, 20]
+  rotations_deg: [5, 10, 20]

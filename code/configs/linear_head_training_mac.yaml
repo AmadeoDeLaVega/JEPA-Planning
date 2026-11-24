@@ -1,0 +1,17 @@
+# Overnight run on an Apple M2 (MPS): reduced compression sweep.
+# Differences from linear_head_training.yaml: ranks 4/16/32/128 only (96x, 24x,
+# 12x, 3x) and a 3x2 tau/lr grid. Steps, batch size, allocations, resamples and
+# controls are unchanged, so these heads are comparable to cluster runs.
+seed: 0
+ranks: [32, 4, 16, 128]
+steps: 2000
+batch_size: 64
+eval_every: 250
+resamples: 3
+budgets: [64, 256, 1024]
+hands_per_target: [2, 4, 8]
+grid:
+  tau: [0.03, 0.1, 0.3]
+  lr: [0.003, 0.01]
+shuffled_control: true
+control_seeds: [0, 1, 2, 3, 4]
