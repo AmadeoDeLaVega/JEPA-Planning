@@ -1,15 +1,16 @@
-"""Unit tests for trust-regularized MPC and local-sensitivity calibration."""
+"""Unit tests for Jensen-certified MPC and spectral-isotropy head fitting."""
 
 from __future__ import annotations
 
 import numpy as np
 import torch
 
+from jepa_planning import linear_head as lh
 from jepa_planning import trust_mpc as tm
 
 
-class _ToyWorldModel:
-    """Minimal deterministic stand-in for EncPredWM with countable unrolls."""
+class _ConvexToyModel:
+    """Unimodal quadratic world model where averaging elites strictly helps."""
 
     def __init__(self, target_action: torch.Tensor):
         self.device = torch.device("cpu")
@@ -20,7 +21,6 @@ class _ToyWorldModel:
         return torch.zeros(1, 1, 4, 8)
 
     def unroll(self, encoded_state: torch.Tensor, actions: torch.Tensor) -> dict[str, torch.Tensor]:
-        # actions has shape [H, B, A]; endpoint feature encodes residual to target_action.
         horizon, batch_size, _ = actions.shape
         self.unroll_count += int(batch_size)
         residual = (actions[-1] - self.target_action[None, :]).unsqueeze(1).repeat(1, 4, 1)
@@ -29,11 +29,23 @@ class _ToyWorldModel:
         return {"visual": padded}
 
 
-def _dummy_observation() -> dict:
-    return {
-        "visual": np.zeros((16, 16, 3), dtype=np.uint8),
-        "proprio": np.zeros(4, dtype=np.float32),
-    }
+class _BimodalBarrierModel(_ConvexToyModel):
+    """Symmetric two-mode world model (+1 or -1 succeeds, 0 hits a high-cost barrier)."""
+
+    def unroll(self, encoded_state: torch.Tensor, actions: torch.Tensor) -> dict[str, torch.Tensor]:
+        horizon, batch_size, _ = actions.shape
+        self.unroll_count += int(batch_size)
+        # Minimum distance to either +target or -target; action = 0 sits at the barrier peak!
+        d_pos = (actions[0] - self.target_action[None, :]).norm(dim=-1, keepdim=True)
+        d_neg = (actions[0] + self.target_action[None, :]).norm(dim=-1, keepdim=True)
+        barrier_residual = torch.minimum(d_pos, d_neg).unsqueeze(1).repeat(1, 4, 4)
+        padded = torch.zeros(horizon + 1, batch_size, 1, 2, 2, 8)
+        padded[-1, :, 0, :, :, :4] = barrier_residual.reshape(batch_size, 2, 2, 4)
+        return {"visual": padded}
+
+
+def _dummy_obs() -> dict:
+    return {"visual": np.zeros((16, 16, 3), dtype=np.uint8), "proprio": np.zeros(4, dtype=np.float32)}
 
 
 def test_budget_parity_and_scale_invariance():
@@ -43,37 +55,42 @@ def test_budget_parity_and_scale_invariance():
     normals = np.random.default_rng(0).standard_normal((2, 16, 2, 4)).astype(np.float32)
     hold_chunk = np.zeros(4, dtype=np.float32)
 
-    model_a = _ToyWorldModel(target)
-    chunk_a, _, info_a = tm.trust_mpc_plan(model_a, _dummy_observation(), goal, head, normals, hold_chunk)
+    model_a = _ConvexToyModel(target)
+    chunk_a, _, info_a = tm.trust_mpc_plan(model_a, _dummy_obs(), goal, head, normals, hold_chunk)
 
-    model_b = _ToyWorldModel(target)
-    chunk_b, _, info_b = tm.trust_mpc_plan(model_b, _dummy_observation(), goal, 7.5 * head, normals, hold_chunk)
+    model_b = _ConvexToyModel(target)
+    chunk_b, _, info_b = tm.trust_mpc_plan(model_b, _dummy_obs(), goal, 6.0 * head, normals, hold_chunk)
 
-    # 2 iterations x 16 budget = 32 exact unrolls, invariant to scaling head L.
-    assert model_a.unroll_count == 32
-    assert info_a["unrolls"] == 32 and info_b["unrolls"] == 32
+    assert model_a.unroll_count == 32 and info_a["unrolls"] == 32
+    assert info_a["jensen_violation"] is False
     assert np.allclose(chunk_a, chunk_b)
 
 
-def test_hysteresis_stay_gate_holds_near_goal():
-    # Target equals hold_chunk = 0, so no noisy sample can beat hold_cost by stay_margin.
-    model = _ToyWorldModel(torch.zeros(4))
-    goal = torch.ones(4, 8) * 0.1
+def test_jensen_barrier_splits_symmetric_bimodal_elites():
+    target = torch.tensor([1.2, 0.0, 0.0, 0.0], dtype=torch.float32)
+    goal = torch.zeros(4, 8)
     head = torch.eye(8) / np.sqrt(8.0)
-    normals = np.random.default_rng(3).standard_normal((2, 12, 2, 4)).astype(np.float32)
+    # Construct symmetric +/- noise so standard elite averaging cancels to 0 (the barrier peak).
+    half = np.random.default_rng(2).standard_normal((2, 8, 2, 4)).astype(np.float32)
+    normals = np.concatenate([half, -half], axis=1)
     hold_chunk = np.zeros(4, dtype=np.float32)
 
-    chosen_chunk, _, info = tm.trust_mpc_plan(
-        model, _dummy_observation(), goal, head, normals, hold_chunk, stay_margin=0.05
-    )
-    assert info["used_stay_gate"] is True
-    assert np.allclose(chosen_chunk, hold_chunk)
+    model = _BimodalBarrierModel(target)
+    chunk, _, info = tm.trust_mpc_plan(model, _dummy_obs(), goal, head, normals, hold_chunk, stay_margin=0.0)
+    assert info["jensen_violation"] is True
+    assert abs(float(chunk[0])) > 0.4
 
 
-def test_select_calibrated_hyperparameters_prefers_local_sensitivity():
-    rows = [
-        {"tau": 0.3, "lr": 0.003, "top1": 0.995, "auroc": 1.0, "sensitivity_shift_px_10": 0.42},
-        {"tau": 0.05, "lr": 0.01, "top1": 0.992, "auroc": 1.0, "sensitivity_shift_px_10": 1.15},
-        {"tau": 0.01, "lr": 0.01, "top1": 0.850, "auroc": 0.99, "sensitivity_shift_px_10": 1.40},
-    ]
-    assert tm.select_calibrated_hyperparameters(rows, min_top1=0.98) == (0.05, 0.01)
+def test_isotropy_regularizer_prevents_rank_one_collapse():
+    rng = np.random.default_rng(4)
+    groups = np.repeat(np.arange(12), 2)
+    # Construct features with one dominant target axis plus three weaker target axes.
+    latents = rng.standard_normal((12, 4)).astype(np.float32) * np.array([4.0, 1.0, 0.8, 0.6], dtype=np.float32)
+    features = torch.zeros(24, 4, 16)
+    for row, g in enumerate(groups):
+        features[row, :, :4] = torch.from_numpy(latents[g])
+        features[row, :, 4:8] = torch.randn(4, 4) * 2.0  # nuisance channels
+
+    sampler = lh.AllocationSampler(groups, num_targets=12, hands_per_target=2, seed=0)
+    head_iso = tm.fit_isotropy_head(features, sampler, steps=150, batch_size=16, isotropy_weight=0.05, rank=8)
+    assert tm.effective_rank(head_iso) > 4.0
