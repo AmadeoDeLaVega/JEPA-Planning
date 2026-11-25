@@ -124,5 +124,11 @@ def render_group(env, goal_snap: dict, goal_pose: np.ndarray, bank_xy: np.ndarra
         elif np.linalg.norm(hand[:2] - goal_pose[:2]) < cfg["min_hand_puck_distance"]:
             rejected["near_puck"] += 1
         else:
-            accepted.append({"frame": env.render().copy(), "hand_bank_index": int(index), "hand_pos": hand})
+            proprio = env.unwrapped._get_curr_obs_combined_no_goal()[:4].astype(np.float32)
+            accepted.append({
+                "frame": env.render().copy(),
+                "proprio": proprio,
+                "hand_bank_index": int(index),
+                "hand_pos": hand,
+            })
     return accepted, rejected
