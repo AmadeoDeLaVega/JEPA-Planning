@@ -75,14 +75,26 @@ def run_episode_suite(
     tasks: dict,
     goals: torch.Tensor,
     cfg: dict,
+    *,
+    goal_mode: str = "per_photo",
+    prototype_count: int = 2,
+    certify_barrier_split: bool = False,
 ) -> list[dict]:
     """Run paired closed-loop episodes for one (head, planner) pair."""
+    if goal_mode not in ("per_photo", "multi_goal_prototype"):
+        raise ValueError(f"unsupported goal_mode: {goal_mode}")
+    if goal_mode == "multi_goal_prototype" and not 1 <= prototype_count <= goals.shape[1]:
+        raise ValueError(
+            f"prototype_count must be between 1 and {goals.shape[1]}, got {prototype_count}"
+        )
+
     action_mean = model.preprocessor.action_mean.cpu().numpy()
     action_std = model.preprocessor.action_std.cpu().numpy()
     hold_chunk = tm.zero_displacement_chunk(
         action_mean, action_std, cfg["controls_per_chunk"], cfg["action_clip"]
     )
     head = head.to(model.device).float()
+    use_certified_split = bool(certify_barrier_split or planner_name == "trust_mpc_certified")
     rows = []
 
     for task_idx in range(len(tasks["target"])):
@@ -91,8 +103,19 @@ def run_episode_suite(
             k: float(v[0])
             for k, v in hp.physical_metrics(tasks["initial"][task_idx][None, 2:5], target).items()
         }
-        for photo_idx in range(cfg["goal_photos"]):
-            goal = goals[task_idx, photo_idx].to(model.device).float()
+        if goal_mode == "per_photo":
+            episode_goals = [
+                (photo_idx, goals[task_idx, photo_idx].to(model.device).float())
+                for photo_idx in range(cfg["goal_photos"])
+            ]
+            used_prototype_count = 1
+        else:
+            episode_goals = [
+                (0, goals[task_idx, :prototype_count].to(model.device).float())
+            ]
+            used_prototype_count = int(prototype_count)
+
+        for photo_idx, goal in episode_goals:
             env.reset_to_state = tasks["initial"][task_idx]
             observation, _ = env.reset()
 
@@ -113,7 +136,8 @@ def run_episode_suite(
                     model.action_dim,
                 )
                 if planner_name == "standard_cem":
-                    action_chunk, _ = cem_plan(model, observation, goal, head, normals, cfg)
+                    cem_goal = goal.mean(dim=0) if goal.ndim == 3 else goal
+                    action_chunk, _ = cem_plan(model, observation, cem_goal, head, normals, cfg)
                     unrolls += cfg["cem_iterations"] * cfg["cem_samples"]
                 else:
                     action_chunk, previous_plan, info_plan = tm.trust_mpc_plan(
@@ -128,6 +152,7 @@ def run_episode_suite(
                         action_clip=cfg["action_clip"],
                         batch_size=cfg["batch_size"],
                         stay_margin=cfg.get("stay_margin", 0.02),
+                        certify_barrier_split=use_certified_split,
                     )
                     unrolls += info_plan["unrolls"]
 
@@ -145,6 +170,9 @@ def run_episode_suite(
                 {
                     "head": head_name,
                     "planner": planner_name,
+                    "goal_mode": goal_mode,
+                    "prototype_count": used_prototype_count,
+                    "certify_barrier_split": bool(use_certified_split and planner_name != "standard_cem"),
                     "task": task_idx,
                     "group": int(tasks["group"][task_idx]),
                     "photo": photo_idx,
@@ -168,19 +196,49 @@ def main() -> None:
     parser.add_argument("--groups", type=Path, required=True, help="Goal-group split directory")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--head-files", type=Path, nargs="*", default=[], help="Saved .pt head files")
-    parser.add_argument("--planners", nargs="+", default=["standard_cem", "trust_mpc"])
+    parser.add_argument(
+        "--planners",
+        nargs="+",
+        default=["standard_cem", "trust_mpc"],
+        help="Planners to evaluate (standard_cem, trust_mpc, trust_mpc_certified)",
+    )
+    parser.add_argument(
+        "--goal-mode",
+        choices=("per_photo", "multi_goal_prototype"),
+        default="per_photo",
+        help="Evaluate each goal photo separately or average K photos into a projected prototype",
+    )
+    parser.add_argument(
+        "--prototype-count",
+        type=int,
+        default=2,
+        help="Number of equivalent goal photos K used when --goal-mode=multi_goal_prototype",
+    )
+    parser.add_argument(
+        "--certify-barrier-split",
+        action="store_true",
+        help="Use rollout #2N to certify the dominant-mode split on strict Jensen violations",
+    )
     parser.add_argument("--config", type=Path, default=ROOT / "code/configs/pusht_head_closed_loop.yaml")
     parser.add_argument("--tasks", type=int, default=24)
     parser.add_argument("--device", default="mps")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    if args.prototype_count < 1:
+        parser.error("--prototype-count must be >= 1")
+
     cfg = yaml.safe_load(args.config.read_text())
     args.output.mkdir(parents=True, exist_ok=True)
 
     from jepa_planning.model import load_world_model
 
-    tasks, goals = load_tasks_from_groups(args.groups, args.split, cfg["goal_photos"], args.tasks)
+    required_photos = (
+        int(args.prototype_count)
+        if args.goal_mode == "multi_goal_prototype"
+        else int(cfg["goal_photos"])
+    )
+    tasks, goals = load_tasks_from_groups(args.groups, args.split, required_photos, args.tasks)
     heads = [("identity", lh.identity_head(lh.FEATURE_DIM))]
     for path in args.head_files:
         matrix, _ = lh.load_head(path)
@@ -192,7 +250,19 @@ def main() -> None:
     try:
         for head_name, matrix in heads:
             for planner_name in args.planners:
-                rows = run_episode_suite(env, model, matrix, head_name, planner_name, tasks, goals, cfg)
+                rows = run_episode_suite(
+                    env,
+                    model,
+                    matrix,
+                    head_name,
+                    planner_name,
+                    tasks,
+                    goals,
+                    cfg,
+                    goal_mode=args.goal_mode,
+                    prototype_count=args.prototype_count,
+                    certify_barrier_split=args.certify_barrier_split,
+                )
                 all_rows.extend(rows)
                 mean_err = float(np.mean([r["final_position_error"] for r in rows]))
                 print(f"{head_name} + {planner_name}: mean final error {mean_err:.2f} px", flush=True)
