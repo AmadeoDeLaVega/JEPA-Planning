@@ -1,0 +1,37 @@
+# Calibrated 3D Meta-World Sawyer Push-v3 goal-image groups.
+#
+# Why this config replaces goal_groups.yaml for Sawyer Push-v3 head fitting:
+# The original goal_groups.yaml sampled a 64-point hand bank (only 16 points
+# each for val and test) over low=[-0.25, 0.45], high=[0.25, 0.95] with
+# max_reach_error=0.02 m. At table height (z ~= 0.02 m), the 7-DoF Sawyer
+# mocap controller cannot reach corners near y=0.95 or extreme x/y extents,
+# causing ~80% of val/test bank points (13/16) to be rejected as `unreached`
+# and leaving targets short of the required K photos.
+#
+# This calibrated configuration restricts the xy hand bank to the verified
+# reachable workspace box [-0.20, 0.20] x [0.58, 0.86] m, enlarges the bank
+# to 320 split-disjoint positions (160 train / 80 val / 80 test), and sets
+# max_reach_error=0.03 m so every target reliably attains K=4 distinct
+# gripper views without moving the puck.
+seed: 0
+warmup_steps: 40   # matches baseline.yaml and goal_groups.yaml target construction
+goal_steps: 30
+first_seed:        # disjoint target seed ranges; test matches baseline evaluation seeds
+  train: 100000
+  val: 200000
+  test: 60000
+num_targets:
+  train: 160
+  val: 24
+  test: 24
+hands_per_target:
+  train: 4
+  val: 4
+  test: 4
+hand_bank:
+  size: 320
+  fractions: {train: 0.5, val: 0.25, test: 0.25}
+  low: [-0.20, 0.58]
+  high: [0.20, 0.86]
+min_hand_puck_distance: 0.06  # metres in xy, matching prepare_task clearance
+max_reach_error: 0.03         # metres in xy between bank target and settled tcp_center

@@ -11,12 +11,13 @@ from __future__ import annotations
 import base64
 from collections.abc import Sequence
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import io
 import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 from urllib.parse import parse_qs, urlparse
 
@@ -257,6 +258,7 @@ def compose_duel_gif_bytes(
     trust_frames: list[np.ndarray],
     goal_frame: np.ndarray,
     fps: int = 4,
+    goal_title: str = "Goal Photo",
 ) -> bytes:
     """Stitch ``[Goal | Plain MSE + CEM | Calibrated Head + Trust-MPC]`` into a GIF."""
     if not baseline_frames or not trust_frames:
@@ -280,7 +282,7 @@ def compose_duel_gif_bytes(
     bg_color = (30, 32, 34)
     header_border = (54, 58, 64)
     titles = [
-        ("Goal Photo", (166, 176, 190)),
+        (goal_title, (166, 176, 190)),
         ("Plain MSE + CEM", (224, 112, 96)),
         ("Calibrated Head + Trust-MPC", (98, 206, 148)),
     ]
@@ -1238,7 +1240,7 @@ class PushTStudioSession:
 
 
 class MetaWorldStudioSession:
-    """Interactive 3D Meta-World Sawyer Push-v3 counterfactual geometry inspector."""
+    """Interactive 3D Meta-World Sawyer Push-v3 inspector and Trust-MPC duel backend."""
 
     def __init__(
         self,
@@ -1248,6 +1250,13 @@ class MetaWorldStudioSession:
         *,
         warmup_steps: int = 15,
         goal_steps: int = 25,
+        controls_per_chunk: int = 5,
+        cem_samples: int = 64,
+        cem_elites: int = 8,
+        cem_iterations: int = 2,
+        batch_size: int = 32,
+        stay_margin: float = 0.02,
+        dual_certify: bool = True,
         default_head: str | None = None,
     ) -> None:
         if not heads:
@@ -1274,7 +1283,34 @@ class MetaWorldStudioSession:
             self.env = env
         self.warmup_steps = int(warmup_steps)
         self.goal_steps = int(goal_steps)
+        self.controls_per_chunk = int(controls_per_chunk)
+        self.cem_samples = int(cem_samples)
+        self.cem_elites = int(cem_elites)
+        self.cem_iterations = int(cem_iterations)
+        self.batch_size = int(batch_size)
+        self.stay_margin = float(stay_margin)
+        self.dual_certify = bool(dual_certify)
+
+        preprocessor = getattr(model, "preprocessor", None)
+        if (
+            preprocessor is not None
+            and hasattr(preprocessor, "action_mean")
+            and hasattr(preprocessor, "action_std")
+        ):
+            raw_mean = np.asarray(preprocessor.action_mean.detach().cpu().numpy(), dtype=np.float32)
+            raw_std = np.asarray(preprocessor.action_std.detach().cpu().numpy(), dtype=np.float32)
+            if raw_mean.shape == (4,) and raw_std.shape == (4,):
+                self.action_mean = raw_mean
+                self.action_std = raw_std
+            else:
+                self.action_mean = np.zeros(4, dtype=np.float32)
+                self.action_std = np.ones(4, dtype=np.float32)
+        else:
+            self.action_mean = np.zeros(4, dtype=np.float32)
+            self.action_std = np.ones(4, dtype=np.float32)
+
         self._lock = threading.Lock()
+        self._latest_duel_frames: tuple[list[np.ndarray], list[np.ndarray], np.ndarray] | None = None
 
     def close(self) -> None:
         """Release MuJoCo simulator resources owned by this session."""
@@ -1423,6 +1459,285 @@ class MetaWorldStudioSession:
             },
         }
 
+    def run_duel(
+        self,
+        seed: int = 60000,
+        hand_offset_angle_deg: float = 45.0,
+        head_name: str | None = None,
+        horizon: int = 2,
+        replans: int = 6,
+    ) -> dict[str, object]:
+        """Run a paired 3D Sawyer Push-v3 closed-loop duel against a distracted-gripper goal photo."""
+        from jepa_planning import metaworld_push as mp
+
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        if isinstance(hand_offset_angle_deg, bool) or not math.isfinite(float(hand_offset_angle_deg)):
+            raise ValueError("hand_offset_angle_deg must be a finite number")
+        if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= 8:
+            raise ValueError("horizon must be an integer between 1 and 8")
+        if isinstance(replans, bool) or not isinstance(replans, int) or not 1 <= replans <= 20:
+            raise ValueError("replans must be an integer between 1 and 20")
+
+        resolved_name, head_matrix = self._resolve_head(head_name)
+        lower, upper, hold_chunk = mwp.metaworld_action_bounds(
+            self.action_mean, self.action_std, self.controls_per_chunk
+        )
+        chunk_action_dim = int(hold_chunk.shape[0])
+        model_action_dim = int(getattr(self.model, "action_dim", chunk_action_dim))
+        if model_action_dim != chunk_action_dim:
+            raise ValueError(
+                f"controls_per_chunk ({self.controls_per_chunk}) implies action_dim {chunk_action_dim}, "
+                f"but model expects {model_action_dim}"
+            )
+
+        angle_rad = math.radians(float(hand_offset_angle_deg))
+        identity_head = self.heads["identity"]
+
+        with self._lock:
+            obs = mp.reset_task(self.env, seed)
+            obs, _ = mp.run_expert(self.env, obs, self.warmup_steps)
+            start_snap = mp.snapshot(self.env)
+
+            mp.run_expert(self.env, obs, self.goal_steps)
+            goal_snap = mp.snapshot(self.env)
+            goal_puck = mp.puck_pose(self.env)[:3].copy()
+
+            # Place the goal-photo Sawyer gripper in the calibrated reachable box
+            # away from the puck so Plain MSE faces a 3D distractor gripper.
+            distractor_hand_xy = np.array(
+                [
+                    float(np.clip(goal_puck[0] + 0.11 * math.cos(angle_rad), -0.20, 0.20)),
+                    float(np.clip(goal_puck[1] + 0.11 * math.sin(angle_rad), 0.58, 0.86)),
+                ],
+                dtype=np.float64,
+            )
+            mp.restore(self.env, goal_snap)
+            offset = np.array(
+                [
+                    distractor_hand_xy[0] - mp.hand_pos(self.env)[0],
+                    distractor_hand_xy[1] - mp.hand_pos(self.env)[1],
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+            mp.move_hand_keep_puck(self.env, offset)
+            goal_rgb = _as_rgb_uint8(self.env.render()).copy()
+            goal_prop = self.env.unwrapped._get_curr_obs_combined_no_goal()[:4].astype(np.float32)
+            goal_hand = mp.hand_pos(self.env)
+            goal_features = _encode_patch_features(self.model, goal_rgb, goal_prop)
+
+            shared_normals = [
+                cem_standard_normals(
+                    seed,
+                    seed,
+                    replan_idx,
+                    self.cem_iterations,
+                    self.cem_samples,
+                    horizon,
+                    chunk_action_dim,
+                )
+                for replan_idx in range(replans)
+            ]
+
+            baseline_result, baseline_rgb = self._run_single_episode_unlocked(
+                start_snap=start_snap,
+                goal_puck=goal_puck,
+                goal_features=goal_features,
+                head=identity_head,
+                planner="standard_cem",
+                shared_normals=shared_normals,
+                lower=lower,
+                upper=upper,
+                hold_chunk=hold_chunk,
+            )
+            trust_result, trust_rgb = self._run_single_episode_unlocked(
+                start_snap=start_snap,
+                goal_puck=goal_puck,
+                goal_features=goal_features,
+                head=head_matrix,
+                planner="trust_mpc",
+                shared_normals=shared_normals,
+                lower=lower,
+                upper=upper,
+                hold_chunk=hold_chunk,
+            )
+            self._latest_duel_frames = (baseline_rgb, trust_rgb, goal_rgb)
+
+        return {
+            "seed": seed,
+            "hand_offset_angle_deg": float(hand_offset_angle_deg),
+            "head_name": resolved_name,
+            "effective_rank": float(tm.effective_rank(head_matrix)),
+            "horizon": horizon,
+            "replans": replans,
+            "controls_per_chunk": self.controls_per_chunk,
+            "goal_hand_xy_m": [float(goal_hand[0]), float(goal_hand[1])],
+            "goal_puck_xyz_m": [float(goal_puck[0]), float(goal_puck[1]), float(goal_puck[2])],
+            "goal_image": encode_png_base64(goal_rgb),
+            "baseline": baseline_result,
+            "trust_mpc": trust_result,
+            "gif_ready": True,
+        }
+
+    def _run_single_episode_unlocked(
+        self,
+        *,
+        start_snap: dict,
+        goal_puck: np.ndarray,
+        goal_features: torch.Tensor,
+        head: torch.Tensor,
+        planner: str,
+        shared_normals: list[np.ndarray],
+        lower: np.ndarray,
+        upper: np.ndarray,
+        hold_chunk: np.ndarray,
+    ) -> tuple[dict[str, object], list[np.ndarray]]:
+        from jepa_planning import metaworld_push as mp
+
+        mp.restore(self.env, start_snap)
+        first_rgb = _as_rgb_uint8(self.env.render()).copy()
+        raw_frames: list[np.ndarray] = [first_rgb]
+        encoded_frames: list[str] = [encode_png_base64(first_rgb)]
+
+        init_metrics = {
+            k: float(v) for k, v in mwp.puck_metrics_cm(mp.puck_pose(self.env)[:3], goal_puck).items()
+        }
+        best_err_3d = init_metrics["error_3d_cm"]
+        step_metrics = init_metrics
+        replan_telemetry: list[dict[str, object]] = []
+        previous_plan: np.ndarray | None = None
+        total_unrolls = 0
+        sim_steps = 0
+        native_successes: list[bool] = []
+        done = False
+
+        head_device = head.to(device=self.model.device, dtype=torch.float32)
+        goal_device = goal_features.to(device=self.model.device, dtype=torch.float32)
+
+        for replan_idx, normals in enumerate(shared_normals):
+            if done:
+                break
+            observation = mp.observe(self.env)
+            if planner == "standard_cem":
+                action_chunk, _, plan_info = mwp.metaworld_cem_plan(
+                    self.model,
+                    observation,
+                    goal_device,
+                    head_device,
+                    normals,
+                    lower,
+                    upper,
+                    num_elites=self.cem_elites,
+                    batch_size=self.batch_size,
+                )
+                extra_diag: dict[str, object] = {
+                    "best_cost": float(plan_info["best_cost"]),
+                    "elite_mean_cost": float(plan_info["elite_mean_cost"]),
+                    "selected_cost": float(plan_info["selected_cost"]),
+                }
+            else:
+                action_chunk, previous_plan, plan_info = mwp.metaworld_trust_mpc_plan(
+                    self.model,
+                    observation,
+                    goal_device,
+                    head_device,
+                    normals,
+                    lower,
+                    upper,
+                    hold_chunk,
+                    previous_plan,
+                    num_elites=self.cem_elites,
+                    batch_size=self.batch_size,
+                    stay_margin=self.stay_margin,
+                    dual_certify=self.dual_certify,
+                )
+                raw_mode_cost = float(plan_info["mode_mean_cost"])
+                extra_diag = {
+                    "hold_cost": float(plan_info["hold_cost"]),
+                    "elite_mean_cost": float(plan_info["elite_mean_cost"]),
+                    "mode_mean_cost": raw_mode_cost if math.isfinite(raw_mode_cost) else None,
+                    "selected_cost": float(plan_info["selected_cost"]),
+                    "jensen_violation": bool(plan_info["jensen_violation"]),
+                    "used_stay_gate": bool(plan_info["used_stay_gate"]),
+                }
+
+            total_unrolls += int(plan_info["unrolls"])
+
+            for control in action_chunk.reshape(self.controls_per_chunk, 4):
+                raw_action = np.clip(control * self.action_std + self.action_mean, -1.0, 1.0).astype(np.float32)
+                _, _, terminated, truncated, step_info = self.env.step(raw_action)
+                sim_steps += 1
+                native_successes.append(bool(step_info.get("success", False)))
+                frame = _as_rgb_uint8(self.env.render()).copy()
+                raw_frames.append(frame)
+                encoded_frames.append(encode_png_base64(frame))
+                if terminated or truncated:
+                    done = True
+                    break
+
+            step_metrics = {
+                k: float(v) for k, v in mwp.puck_metrics_cm(mp.puck_pose(self.env)[:3], goal_puck).items()
+            }
+            best_err_3d = min(best_err_3d, step_metrics["error_3d_cm"])
+
+            replan_telemetry.append(
+                {
+                    "replan": replan_idx + 1,
+                    "frame_index": len(raw_frames) - 1,
+                    "error_3d_cm": step_metrics["error_3d_cm"],
+                    "error_xy_cm": step_metrics["error_xy_cm"],
+                    "success_5cm": bool(step_metrics["success_5cm"]),
+                    "success_3cm": bool(step_metrics["success_3cm"]),
+                    "success_2cm": bool(step_metrics["success_2cm"]),
+                    "unrolls": int(plan_info["unrolls"]),
+                    **extra_diag,
+                }
+            )
+
+        summary: dict[str, object] = {
+            "initial_error_3d_cm": init_metrics["error_3d_cm"],
+            "final_error_3d_cm": step_metrics["error_3d_cm"],
+            "final_error_xy_cm": step_metrics["error_xy_cm"],
+            "best_error_3d_cm": best_err_3d,
+            "post_peak_drift_cm": max(0.0, step_metrics["error_3d_cm"] - best_err_3d),
+            "success_5cm": bool(step_metrics["success_5cm"]),
+            "success_3cm": bool(step_metrics["success_3cm"]),
+            "success_2cm": bool(step_metrics["success_2cm"]),
+            "native_success": bool(native_successes[-1]) if native_successes else False,
+            "unrolls": int(total_unrolls),
+            "sim_steps": int(sim_steps),
+        }
+        if planner == "trust_mpc":
+            summary["jensen_violations"] = int(sum(1 for row in replan_telemetry if row["jensen_violation"]))
+            summary["stay_gate_triggers"] = int(sum(1 for row in replan_telemetry if row["used_stay_gate"]))
+
+        return {
+            "planner": planner,
+            "frames": encoded_frames,
+            "replan_telemetry": replan_telemetry,
+            "summary": summary,
+        }, raw_frames
+
+    def has_latest_duel_gif(self) -> bool:
+        """Whether at least one 3D Sawyer duel has been cached for GIF export."""
+        with self._lock:
+            return self._latest_duel_frames is not None
+
+    def get_latest_duel_gif_bytes(self, fps: int = 4) -> bytes:
+        """Encode the most recent 3D Sawyer duel as a side-by-side animated GIF."""
+        with self._lock:
+            if self._latest_duel_frames is None:
+                raise LookupError("No 3D Meta-World duel has been executed yet")
+            baseline_rgb, trust_rgb, goal_rgb = self._latest_duel_frames
+        return compose_duel_gif_bytes(
+            baseline_rgb,
+            trust_rgb,
+            goal_rgb,
+            fps=fps,
+            goal_title="3D Goal Photo",
+        )
+
 
 # ------------------------------------------------------------- unified backend
 
@@ -1461,6 +1776,18 @@ class PlanningStudioBackend:
                 "enabled": self.metaworld is not None,
                 "heads": _head_catalog_metadata(self.metaworld.heads) if self.metaworld is not None else [],
                 "default_head": self.metaworld.default_head if self.metaworld is not None else None,
+                "has_duel_gif": self.metaworld.has_latest_duel_gif() if self.metaworld is not None else False,
+                "config": (
+                    {
+                        "controls_per_chunk": self.metaworld.controls_per_chunk,
+                        "cem_samples": self.metaworld.cem_samples,
+                        "cem_elites": self.metaworld.cem_elites,
+                        "cem_iterations": self.metaworld.cem_iterations,
+                        "stay_margin": self.metaworld.stay_margin,
+                    }
+                    if self.metaworld is not None
+                    else None
+                ),
             },
         }
 
@@ -1517,6 +1844,24 @@ class PlanningStudioBackend:
             shift_cm=float(payload.get("shift_cm", 5.0)),
             head_name=payload.get("head_name"),
         )
+
+    def run_metaworld_duel(self, payload: dict[str, object]) -> dict[str, object]:
+        """Run a paired 3D Meta-World Sawyer Push-v3 closed-loop duel if enabled."""
+        if self.metaworld is None:
+            raise RuntimeError("Meta-World session is not enabled. Launch with --enable-metaworld.")
+        return self.metaworld.run_duel(
+            seed=int(payload.get("seed", 60000)),
+            hand_offset_angle_deg=float(payload.get("hand_offset_angle_deg", 45.0)),
+            head_name=payload.get("head_name"),
+            horizon=int(payload.get("horizon", 2)),
+            replans=int(payload.get("replans", 6)),
+        )
+
+    def get_metaworld_duel_gif_bytes(self, fps: int = 4) -> bytes:
+        """Return the latest 3D Sawyer Push-v3 duel as an animated GIF byte buffer."""
+        if self.metaworld is None:
+            raise RuntimeError("Meta-World session is not enabled. Launch with --enable-metaworld.")
+        return self.metaworld.get_latest_duel_gif_bytes(fps=fps)
 
     def close(self) -> None:
         """Close underlying simulator environments."""
@@ -2170,21 +2515,30 @@ STUDIO_HTML = """<!DOCTYPE html>
       <div id="mw-controls" class="mw-controls">
         <div class="field">
           <label for="mw-seed">Task Seed</label>
-          <input id="mw-seed" type="number" value="1000" />
+          <input id="mw-seed" type="number" value="60000" />
         </div>
         <div class="field">
           <label for="mw-angle">Distractor Arm Angle (&deg;)</label>
-          <input id="mw-angle" type="number" value="135" min="0" max="360" />
+          <input id="mw-angle" type="number" value="45" min="0" max="360" />
         </div>
         <div class="field">
           <label for="mw-shift">Puck Shift (cm)</label>
           <input id="mw-shift" type="number" value="5.0" step="0.5" min="1.0" max="12.0" />
         </div>
         <div class="field">
+          <label for="mw-horizon">Horizon</label>
+          <input id="mw-horizon" type="number" value="2" min="1" max="8" />
+        </div>
+        <div class="field">
+          <label for="mw-replans">Replans</label>
+          <input id="mw-replans" type="number" value="6" min="1" max="20" />
+        </div>
+        <div class="field">
           <label for="mw-head-select">Meta-World Head</label>
           <select id="mw-head-select"></select>
         </div>
-        <button id="btn-mw-inspect" class="btn primary">Inspect 3D Patch Geometry</button>
+        <button id="btn-mw-inspect" class="btn">Inspect 3D Patch Geometry</button>
+        <button id="btn-mw-duel" class="btn primary">Run 3D Sawyer Duel</button>
       </div>
       <div id="mw-status" class="status-line" style="margin-bottom:12px;">Ready.</div>
 
@@ -2241,6 +2595,82 @@ STUDIO_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <div class="panel duel-panel">
+      <div class="panel-title">
+        <span>3D Sawyer Closed-Loop Duel (Exact Rollout Parity)</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span id="mw-duel-parity-badge" class="badge">unrolls: --</span>
+          <a id="btn-mw-download-gif" class="btn small emerald hidden" href="/api/metaworld_duel.gif" download="metaworld_sawyer_duel.gif">Download 3D Duel GIF</a>
+        </div>
+      </div>
+
+      <div class="kpi-strip">
+        <div class="kpi">
+          <div class="kpi-label">Plain MSE + CEM Final</div>
+          <div class="kpi-value" style="color:var(--crimson)" id="mw-duel-mse-final">--</div>
+          <div class="kpi-sub" id="mw-duel-mse-drift">drift --</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Head + Trust-MPC Final</div>
+          <div class="kpi-value" style="color:var(--emerald)" id="mw-duel-trust-final">--</div>
+          <div class="kpi-sub" id="mw-duel-trust-drift">drift --</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Jensen Barrier Splits</div>
+          <div class="kpi-value" style="color:var(--amber)" id="mw-duel-jensen-count">--</div>
+          <div class="kpi-sub">dual-certified mode splits</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Stay-Gate Triggers</div>
+          <div class="kpi-value" style="color:var(--blue)" id="mw-duel-stay-count">--</div>
+          <div class="kpi-sub">hold-cost certifications</div>
+        </div>
+      </div>
+
+      <div class="duel-stage">
+        <div class="frame-card">
+          <img id="mw-duel-img-goal" alt="3D goal photo" />
+          <div class="frame-caption"><span>3D Goal Photo (Distracted Gripper)</span><span class="status-line">Target</span></div>
+        </div>
+        <div class="frame-card">
+          <img id="mw-duel-img-base" alt="Plain MSE + CEM 3D trajectory" />
+          <div class="frame-caption"><span>Plain MSE + CEM</span><span id="mw-duel-cap-base">--</span></div>
+        </div>
+        <div class="frame-card">
+          <img id="mw-duel-img-trust" alt="Calibrated Head + Trust-MPC 3D trajectory" />
+          <div class="frame-caption"><span>Calibrated Head + Trust-MPC</span><span id="mw-duel-cap-trust">--</span></div>
+        </div>
+      </div>
+
+      <div class="scrubber-bar">
+        <button id="btn-mw-play" class="btn small" disabled>Play</button>
+        <input id="mw-duel-scrubber" type="range" min="0" max="0" value="0" disabled />
+        <span id="mw-duel-frame-label" class="status-line">Step 0 / 0</span>
+      </div>
+
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Replan</th>
+              <th>MSE 3D (cm)</th>
+              <th>Trust 3D (cm)</th>
+              <th>Trust XY (cm)</th>
+              <th>Hold Cost</th>
+              <th>Elite Mean Cost</th>
+              <th>Selected Cost</th>
+              <th>Jensen Gate</th>
+              <th>Stay Gate</th>
+              <th>Unrolls</th>
+            </tr>
+          </thead>
+          <tbody id="mw-telemetry-body">
+            <tr><td colspan="10" style="text-align:center;color:var(--muted);">Run a 3D Sawyer Duel to inspect per-replan telemetry.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -2266,6 +2696,9 @@ STUDIO_HTML = """<!DOCTYPE html>
     waypointChain: null,
     wpPlayTimer: null,
     wpFrameIdx: 0,
+    mwDuel: null,
+    mwPlayTimer: null,
+    mwFrameIdx: 0,
   };
 
   function toCanvas(v) { return (v / ARENA) * canvas.width; }
@@ -2757,6 +3190,122 @@ STUDIO_HTML = """<!DOCTYPE html>
     }
   });
 
+  function showMwDuelFrame(idx) {
+    if (!state.mwDuel) return;
+    const baseFrames = state.mwDuel.baseline.frames;
+    const trustFrames = state.mwDuel.trust_mpc.frames;
+    const maxIdx = Math.max(0, Math.max(baseFrames.length, trustFrames.length) - 1);
+    state.mwFrameIdx = Math.max(0, Math.min(maxIdx, idx));
+    document.getElementById("mw-duel-img-base").src = baseFrames[Math.min(state.mwFrameIdx, baseFrames.length - 1)];
+    document.getElementById("mw-duel-img-trust").src = trustFrames[Math.min(state.mwFrameIdx, trustFrames.length - 1)];
+    document.getElementById("mw-duel-scrubber").value = state.mwFrameIdx;
+    document.getElementById("mw-duel-frame-label").textContent = `Step ${state.mwFrameIdx} / ${maxIdx}`;
+  }
+
+  function stopMwPlayback() {
+    if (state.mwPlayTimer) { clearInterval(state.mwPlayTimer); state.mwPlayTimer = null; }
+    document.getElementById("btn-mw-play").textContent = "Play";
+  }
+
+  async function runMwDuel() {
+    stopMwPlayback();
+    const mwStatus = document.getElementById("mw-status");
+    const btn = document.getElementById("btn-mw-duel");
+    btn.disabled = true;
+    mwStatus.textContent = "Running paired 3D Sawyer Push-v3 closed-loop duel...";
+    try {
+      const resp = await fetch("/api/metaworld_duel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          seed: Number(document.getElementById("mw-seed").value),
+          hand_offset_angle_deg: Number(document.getElementById("mw-angle").value),
+          head_name: document.getElementById("mw-head-select").value,
+          horizon: Number(document.getElementById("mw-horizon").value),
+          replans: Number(document.getElementById("mw-replans").value),
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "3D Sawyer duel request failed");
+
+      state.mwDuel = data;
+      const bSum = data.baseline.summary;
+      const tSum = data.trust_mpc.summary;
+
+      document.getElementById("mw-duel-img-goal").src = data.goal_image;
+      document.getElementById("mw-duel-mse-final").textContent = `${fmt(bSum.final_error_3d_cm, 2)} cm`;
+      document.getElementById("mw-duel-mse-drift").textContent = `best ${fmt(bSum.best_error_3d_cm, 2)} | drift ${fmt(bSum.post_peak_drift_cm, 2)}`;
+      document.getElementById("mw-duel-trust-final").textContent = `${fmt(tSum.final_error_3d_cm, 2)} cm`;
+      document.getElementById("mw-duel-trust-drift").textContent = `best ${fmt(tSum.best_error_3d_cm, 2)} | drift ${fmt(tSum.post_peak_drift_cm, 2)}`;
+      document.getElementById("mw-duel-jensen-count").textContent = `${tSum.jensen_violations} / ${data.replans}`;
+      document.getElementById("mw-duel-stay-count").textContent = `${tSum.stay_gate_triggers} / ${data.replans}`;
+      document.getElementById("mw-duel-parity-badge").textContent = `unrolls: ${bSum.unrolls} vs ${tSum.unrolls}`;
+      document.getElementById("mw-duel-cap-base").textContent = `final ${fmt(bSum.final_error_3d_cm, 2)} cm`;
+      document.getElementById("mw-duel-cap-trust").textContent = `final ${fmt(tSum.final_error_3d_cm, 2)} cm`;
+
+      const maxIdx = Math.max(0, Math.max(data.baseline.frames.length, data.trust_mpc.frames.length) - 1);
+      const scrubber = document.getElementById("mw-duel-scrubber");
+      scrubber.max = maxIdx;
+      scrubber.disabled = false;
+      document.getElementById("btn-mw-play").disabled = false;
+      const dl = document.getElementById("btn-mw-download-gif");
+      dl.classList.remove("hidden");
+      dl.href = `/api/metaworld_duel.gif?ts=${Date.now()}`;
+      showMwDuelFrame(maxIdx);
+
+      const tbody = document.getElementById("mw-telemetry-body");
+      tbody.innerHTML = "";
+      const rowCount = Math.max(data.baseline.replan_telemetry.length, data.trust_mpc.replan_telemetry.length);
+      for (let i = 0; i < rowCount; i++) {
+        const bRow = data.baseline.replan_telemetry[i] || {};
+        const tRow = data.trust_mpc.replan_telemetry[i] || {};
+        const tr = document.createElement("tr");
+        const jensenBadge = tRow.jensen_violation
+          ? '<span class="badge crimson">SPLIT</span>'
+          : '<span class="badge">UNIMODAL</span>';
+        const stayBadge = tRow.used_stay_gate
+          ? '<span class="badge emerald">HOLD</span>'
+          : '<span class="badge">MOVE</span>';
+        tr.innerHTML = `
+          <td>#${tRow.replan || bRow.replan || i + 1}</td>
+          <td>${fmt(bRow.error_3d_cm, 2)}</td>
+          <td>${fmt(tRow.error_3d_cm, 2)}</td>
+          <td>${fmt(tRow.error_xy_cm, 2)}</td>
+          <td>${fmt(tRow.hold_cost, 4)}</td>
+          <td>${fmt(tRow.elite_mean_cost, 4)}</td>
+          <td>${fmt(tRow.selected_cost, 4)}</td>
+          <td>${jensenBadge}</td>
+          <td>${stayBadge}</td>
+          <td>${tRow.unrolls ?? "--"}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      mwStatus.textContent = "3D Sawyer duel complete.";
+    } catch (err) {
+      mwStatus.textContent = `Error: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById("btn-mw-duel").addEventListener("click", runMwDuel);
+  document.getElementById("mw-duel-scrubber").addEventListener("input", (e) => {
+    stopMwPlayback();
+    showMwDuelFrame(Number(e.target.value));
+  });
+  document.getElementById("btn-mw-play").addEventListener("click", () => {
+    if (!state.mwDuel) return;
+    if (state.mwPlayTimer) { stopMwPlayback(); return; }
+    const maxIdx = Math.max(state.mwDuel.baseline.frames.length, state.mwDuel.trust_mpc.frames.length) - 1;
+    if (state.mwFrameIdx >= maxIdx) showMwDuelFrame(0);
+    document.getElementById("btn-mw-play").textContent = "Pause";
+    state.mwPlayTimer = setInterval(() => {
+      if (state.mwFrameIdx >= maxIdx) { stopMwPlayback(); return; }
+      showMwDuelFrame(state.mwFrameIdx + 1);
+    }, 240);
+  });
+
   async function init() {
     const resp = await fetch("/api/state");
     const info = await resp.json();
@@ -2814,6 +3363,7 @@ STUDIO_HTML = """<!DOCTYPE html>
       mwBadge.textContent = "disabled";
       document.getElementById("mw-disabled-notice").classList.remove("hidden");
       document.getElementById("btn-mw-inspect").disabled = true;
+      document.getElementById("btn-mw-duel").disabled = true;
     }
 
     drawArena();
@@ -2837,8 +3387,8 @@ def create_studio_server(
     backend: PlanningStudioBackend,
     *,
     quiet: bool = False,
-) -> ThreadingHTTPServer:
-    """Create a multi-threaded HTTP server exposing the studio UI and JSON API."""
+) -> HTTPServer:
+    """Create an HTTP server exposing the studio UI and JSON API."""
 
     class StudioRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A002
@@ -2933,6 +3483,29 @@ def create_studio_server(
                 )
                 return
 
+            if route == "/api/metaworld_duel.gif":
+                query = parse_qs(parsed.query)
+                fps_raw = query.get("fps", ["4"])[0]
+                try:
+                    fps = int(fps_raw)
+                    gif_bytes = backend.get_metaworld_duel_gif_bytes(fps=fps)
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                    return
+                except LookupError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    gif_bytes,
+                    "image/gif",
+                    extra_headers={"Content-Disposition": 'attachment; filename="metaworld_sawyer_duel.gif"'},
+                )
+                return
+
             self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {route}"})
 
         def do_POST(self) -> None:  # noqa: N802
@@ -2947,6 +3520,8 @@ def create_studio_server(
                     self._send_json(HTTPStatus.OK, backend.run_pusht_waypoint_chain(payload))
                 elif route == "/api/metaworld_inspect":
                     self._send_json(HTTPStatus.OK, backend.inspect_metaworld(payload))
+                elif route == "/api/metaworld_duel":
+                    self._send_json(HTTPStatus.OK, backend.run_metaworld_duel(payload))
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {route}"})
             except (KeyError, ValueError, TypeError) as exc:
@@ -2956,6 +3531,11 @@ def create_studio_server(
             except Exception as exc:  # pragma: no cover - defensive fallback
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
+    # On macOS, MuJoCo's GLFW offscreen context requires rendering on the main
+    # thread; serving synchronously keeps Meta-World requests on the thread
+    # running serve_forever() instead of spawning worker threads.
+    if backend.metaworld is not None and sys.platform == "darwin":
+        return HTTPServer((host, port), StudioRequestHandler)
     server = ThreadingHTTPServer((host, port), StudioRequestHandler)
     server.daemon_threads = True
     return server

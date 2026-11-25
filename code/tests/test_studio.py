@@ -40,15 +40,26 @@ class _MockPatchWorldModel:
     rollout parity without loading DINO-WM checkpoints.
     """
 
-    def __init__(self, feature_dim: int = 16, controls_per_chunk: int = 2) -> None:
+    def __init__(
+        self,
+        feature_dim: int = 16,
+        controls_per_chunk: int = 2,
+        step_action_dim: int = 2,
+    ) -> None:
         self.device = torch.device("cpu")
         self.feature_dim = feature_dim
-        self.action_dim = controls_per_chunk * 2
+        self.action_dim = controls_per_chunk * step_action_dim
         self.unroll_count = 0
-        self.preprocessor = SimpleNamespace(
-            action_mean=torch.zeros(2, dtype=torch.float32),
-            action_std=torch.full((2,), 20.0, dtype=torch.float32),
-        )
+        if step_action_dim == 4:
+            self.preprocessor = SimpleNamespace(
+                action_mean=torch.tensor([0.1, -0.05, 0.0, 0.0], dtype=torch.float32),
+                action_std=torch.tensor([0.5, 0.5, 0.5, 0.5], dtype=torch.float32),
+            )
+        else:
+            self.preprocessor = SimpleNamespace(
+                action_mean=torch.zeros(step_action_dim, dtype=torch.float32),
+                action_std=torch.full((step_action_dim,), 20.0, dtype=torch.float32),
+            )
 
     def encode(self, obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         visual = obs["visual"]  # [B, T, 3, H, W]
@@ -331,6 +342,21 @@ def test_studio_http_server_roundtrip():
         with pytest.raises(urllib.error.HTTPError) as mw_err:
             urllib.request.urlopen(req_mw, timeout=5)
         assert mw_err.value.code == 503
+
+        # POST /api/metaworld_duel and GET /api/metaworld_duel.gif when disabled return 503
+        req_mw_duel = urllib.request.Request(
+            f"{base_url}/api/metaworld_duel",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as mw_duel_err:
+            urllib.request.urlopen(req_mw_duel, timeout=5)
+        assert mw_duel_err.value.code == 503
+
+        with pytest.raises(urllib.error.HTTPError) as mw_gif_err:
+            urllib.request.urlopen(f"{base_url}/api/metaworld_duel.gif", timeout=5)
+        assert mw_gif_err.value.code == 503
     finally:
         server.shutdown()
         server.server_close()
@@ -371,6 +397,140 @@ def test_metaworld_studio_session_inspect_with_real_mujoco():
         mw_session.close()
 
 
+def test_metaworld_studio_duel_and_http_roundtrip_with_real_mujoco():
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    if sys.platform == "darwin":
+        os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    pusht_model = _MockPatchWorldModel(feature_dim=16, controls_per_chunk=2, step_action_dim=2)
+    mw_model = _MockPatchWorldModel(feature_dim=16, controls_per_chunk=2, step_action_dim=4)
+    heads = {
+        "identity": lh.identity_head(16),
+        "calibrated_iso": _structure_head(16),
+    }
+    pusht_session = PushTStudioSession(
+        pusht_model,
+        heads,
+        controls_per_chunk=2,
+        cem_horizon=2,
+        cem_samples=6,
+        cem_elites=2,
+        cem_iterations=2,
+        batch_size=6,
+        default_head="calibrated_iso",
+    )
+    mw_session = MetaWorldStudioSession(
+        mw_model,
+        heads,
+        warmup_steps=5,
+        goal_steps=5,
+        controls_per_chunk=2,
+        cem_samples=6,
+        cem_elites=2,
+        cem_iterations=2,
+        batch_size=6,
+        default_head="calibrated_iso",
+    )
+    backend = PlanningStudioBackend(pusht_session, metaworld_session=mw_session)
+    server = create_studio_server("127.0.0.1", 0, backend, quiet=True)
+    port = server.server_address[1]
+    base_url = f"http://127.0.0.1:{port}"
+    expected_unrolls = 1 * 2 * 6  # replans * cem_iterations * cem_samples
+    client_errors: list[BaseException] = []
+
+    def _run_http_checks() -> None:
+        try:
+            # GET /api/metaworld_duel.gif before any duel returns 404
+            with pytest.raises(urllib.error.HTTPError) as pre_err:
+                urllib.request.urlopen(f"{base_url}/api/metaworld_duel.gif", timeout=5)
+            assert pre_err.value.code == 404
+
+            # HTTP POST /api/metaworld_duel
+            payload = json.dumps(
+                {
+                    "seed": 60000,
+                    "hand_offset_angle_deg": 45.0,
+                    "head_name": "calibrated_iso",
+                    "horizon": 2,
+                    "replans": 1,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base_url}/api/metaworld_duel",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                assert resp.status == 200
+                duel_data = json.loads(resp.read().decode("utf-8"))
+                assert duel_data["gif_ready"] is True
+                assert duel_data["head_name"] == "calibrated_iso"
+                assert duel_data["effective_rank"] == pytest.approx(4.0, abs=1e-3)
+                assert duel_data["baseline"]["summary"]["unrolls"] == expected_unrolls
+                assert duel_data["trust_mpc"]["summary"]["unrolls"] == expected_unrolls
+                assert duel_data["trust_mpc"]["summary"]["final_error_3d_cm"] >= 0.0
+                assert len(duel_data["baseline"]["frames"]) == 1 + 2
+                assert len(duel_data["trust_mpc"]["frames"]) == 1 + 2
+                assert _decode_data_uri(duel_data["goal_image"]).size == (224, 224)
+                assert _decode_data_uri(duel_data["trust_mpc"]["frames"][-1]).size == (224, 224)
+                for field in (
+                    "error_3d_cm",
+                    "error_xy_cm",
+                    "hold_cost",
+                    "elite_mean_cost",
+                    "selected_cost",
+                    "jensen_violation",
+                    "used_stay_gate",
+                ):
+                    assert field in duel_data["trust_mpc"]["replan_telemetry"][0]
+
+            # HTTP GET /api/metaworld_duel.gif returns valid animated GIF
+            with urllib.request.urlopen(f"{base_url}/api/metaworld_duel.gif?fps=4", timeout=5) as resp:
+                assert resp.status == 200
+                assert resp.headers.get("Content-Type") == "image/gif"
+                gif_bytes = resp.read()
+                assert gif_bytes.startswith(b"GIF89a")
+                with Image.open(io.BytesIO(gif_bytes)) as gif:
+                    assert gif.format == "GIF"
+                    assert getattr(gif, "n_frames", 1) == 3
+                    assert gif.size == (700, 262)
+
+            # GET /api/state reflects enabled Meta-World and cached duel GIF
+            with urllib.request.urlopen(f"{base_url}/api/state", timeout=5) as resp:
+                state_data = json.loads(resp.read().decode("utf-8"))
+                assert state_data["metaworld"]["enabled"] is True
+                assert state_data["metaworld"]["has_duel_gif"] is True
+        except BaseException as exc:  # pragma: no cover - propagated to main thread
+            client_errors.append(exc)
+        finally:
+            server.shutdown()
+
+    try:
+        # Serve on the main thread so macOS GLFW renders on its owning thread.
+        client_thread = threading.Thread(target=_run_http_checks, daemon=True)
+        client_thread.start()
+        server.serve_forever(poll_interval=0.05)
+        client_thread.join(timeout=15)
+        assert not client_errors, f"HTTP client check failed: {client_errors[0]!r}"
+
+        # Also verify direct session invocation and exact unroll budget accounting.
+        mw_model.unroll_count = 0
+        direct = mw_session.run_duel(
+            seed=60000,
+            hand_offset_angle_deg=45.0,
+            head_name="calibrated_iso",
+            horizon=2,
+            replans=1,
+        )
+        assert direct["gif_ready"] is True
+        assert mw_model.unroll_count == 2 * expected_unrolls
+        assert mw_session.get_latest_duel_gif_bytes(fps=4).startswith(b"GIF89a")
+    finally:
+        server.server_close()
+        backend.close()
+
+
 def test_load_heads_directory_and_cli_parser(tmp_path):
     from scripts.run_planning_studio import build_parser
 
@@ -382,9 +542,20 @@ def test_load_heads_directory_and_cli_parser(tmp_path):
     assert default_head == "iso005_demo"
 
     args = build_parser().parse_args(
-        ["--host", "127.0.0.1", "--port", "9001", "--export-demo-gif", str(tmp_path / "out.gif")]
+        [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9001",
+            "--export-demo-gif",
+            str(tmp_path / "out.gif"),
+            "--export-metaworld-gif",
+            str(tmp_path / "mw_out.gif"),
+        ]
     )
     assert args.host == "127.0.0.1"
     assert args.port == 9001
     assert args.export_demo_gif == tmp_path / "out.gif"
+    assert args.export_metaworld_gif == tmp_path / "mw_out.gif"
+    assert args.metaworld_heads_dir.name == "metaworld_calibrated_heads"
 

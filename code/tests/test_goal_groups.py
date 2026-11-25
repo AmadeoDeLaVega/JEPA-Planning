@@ -19,6 +19,18 @@ def test_default_config_is_valid(cfg):
     gg.validate_config(cfg)
 
 
+def test_calibrated_metaworld_config_is_valid():
+    calibrated = yaml.safe_load((ROOT / "code/configs/metaworld_goal_groups_calibrated.yaml").read_text())
+    gg.validate_config(calibrated)
+    assert calibrated["hand_bank"]["size"] == 320
+    assert calibrated["hand_bank"]["low"] == [-0.20, 0.58]
+    assert calibrated["hand_bank"]["high"] == [0.20, 0.86]
+    assert calibrated["max_reach_error"] == pytest.approx(0.03)
+    assert calibrated["min_hand_puck_distance"] == pytest.approx(0.06)
+    assert calibrated["hands_per_target"] == {"train": 4, "val": 4, "test": 4}
+    assert calibrated["num_targets"] == {"train": 160, "val": 24, "test": 24}
+
+
 def test_target_seeds_are_disjoint_and_test_matches_baseline(cfg):
     seeds = {split: set(gg.target_seeds(cfg, split)) for split in gg.SPLITS}
     assert not seeds["train"] & seeds["val"] and not seeds["train"] & seeds["test"]
