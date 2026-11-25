@@ -4,6 +4,15 @@ Research reports, architecture notes, and reproduction guides for the
 JEPA-Planning project. Raw logs, model checkpoints, and generated outputs live
 outside Git under `results/` and `checkpoints/`.
 
+## Unified Capstone Report
+
+- [`unified_capstone_results.md`](unified_capstone_results.md) — End-to-end
+  synthesis across all four tracks with locked held-out `test` benchmarks for
+  2D PushT (`N = 24`), zero-privileged-state 2-stage visual waypoint chaining
+  (`N = 8`), and 3D Meta-World Sawyer `Push-v3` (`N = 72` audit, `N = 12`
+  candidate bank & `H = 6` closed loop), embedded figures/GIFs, and
+  reproducibility commands.
+
 ## Setup & Baseline Reproduction
 
 - [`reproduction.md`](reproduction.md) — Environment setup, checkpoint

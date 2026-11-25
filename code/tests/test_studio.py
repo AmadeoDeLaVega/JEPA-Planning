@@ -26,6 +26,7 @@ from jepa_planning.studio import (
     MetaWorldStudioSession,
     PlanningStudioBackend,
     PushTStudioSession,
+    _encode_patch_features,
     compose_duel_gif_bytes,
     create_studio_server,
     encode_png_base64,
@@ -623,4 +624,45 @@ def test_spatial_channel_head_loading_heatmap_and_metaworld_session(tmp_path):
         assert duel["trust_mpc"]["summary"]["unrolls"] == duel["baseline"]["summary"]["unrolls"]
     finally:
         mw_session.close()
+
+
+class _TensorDictLike:
+    """Minimal non-dict mapping container mirroring tensordict.TensorDict."""
+
+    def __init__(self, data: dict[str, torch.Tensor]) -> None:
+        self._data = data
+
+    def keys(self):
+        return self._data.keys()
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._data[key]
+
+
+def test_studio_encode_patch_features_handles_tensordict_like_and_calibrated_defaults():
+    """_encode_patch_features unpacks non-dict .keys()/__getitem__ containers cleanly."""
+    expected = torch.linspace(-1.0, 1.0, 256 * 16, dtype=torch.float32).reshape(256, 16)
+
+    class _TensorDictEncoder:
+        def encode(self, obs: dict[str, torch.Tensor]):
+            assert set(obs.keys()) == {"visual", "proprio"}
+            return _TensorDictLike({"visual": expected[None, None].clone()})
+
+    rgb = np.full((224, 224, 3), 120, dtype=np.uint8)
+    proprio = np.zeros((4,), dtype=np.float32)
+
+    tokens = _encode_patch_features(_TensorDictEncoder(), rgb, proprio)
+    assert tokens.shape == (256, 16)
+    assert tokens.dtype == torch.float32
+    assert tokens.device.type == "cpu"
+    torch.testing.assert_close(tokens, expected)
+
+    # Also verify calibrated MetaWorldStudioSession defaults are preserved.
+    import inspect
+
+    sig = inspect.signature(MetaWorldStudioSession.__init__)
+    assert sig.parameters["warmup_steps"].default == 40
+    assert sig.parameters["goal_steps"].default == 30
+    assert sig.parameters["stay_margin"].default == 0.0
+
 

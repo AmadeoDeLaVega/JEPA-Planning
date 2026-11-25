@@ -48,9 +48,16 @@ def _as_rgb_uint8(frame: np.ndarray) -> np.ndarray:
 def encode_visual_features(model, observation: dict) -> torch.Tensor:
     """Encode a single observation dict into float32 patch features ``[P, D]``."""
     visual = torch.from_numpy(_as_rgb_uint8(observation["visual"])).permute(2, 0, 1)[None, None]
-    proprio = torch.from_numpy(np.asarray(observation["proprio"], dtype=np.float32))[None, None]
-    encoded = model.encode({"visual": visual, "proprio": proprio})
-    vis = encoded["visual"] if isinstance(encoded, dict) else encoded
+    if "proprio" in observation and observation["proprio"] is not None:
+        proprio = torch.from_numpy(np.asarray(observation["proprio"], dtype=np.float32))[None, None]
+        encoded = model.encode({"visual": visual, "proprio": proprio})
+    else:
+        encoded = model.encode(visual)
+    vis = (
+        encoded["visual"]
+        if isinstance(encoded, dict) or (hasattr(encoded, "keys") and "visual" in encoded.keys())
+        else encoded
+    )
     if vis.ndim >= 4:
         vis = vis[0, -1]
     elif vis.ndim == 3:

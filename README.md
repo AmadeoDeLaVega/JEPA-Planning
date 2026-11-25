@@ -48,6 +48,27 @@ heatmaps, 2D PushT drag-and-drop closed-loop duels, 2-stage visual waypoint
 chains, and 3D Meta-World Sawyer `Push-v3` counterfactual inspection, paired
 closed-loop duels, and side-by-side animated GIF export.
 
+## Headline Capstone Results
+
+Full held-out `test` tables, spectral diagnostics, failure-mode analyses, and
+exact reproduction commands are documented in
+[**`docs/unified_capstone_results.md`**](docs/unified_capstone_results.md).
+
+| Domain & Protocol | Baseline (Plain MSE + Std CEM) | Unified Stack (Calibrated Head + Cert Trust-MPC) | Key Gain / Finding |
+|---|---:|---:|---|
+| **2D PushT Closed-Loop** (`N=24` test, `512` unrolls) | `25.89 px` (`IQM 19.44`, `54%` $\le 20\text{ px}$) | **`13.84 px`** (`IQM 10.46`, `79%` $\le 20\text{ px}$, `0.00 px` drift) | **`-46.5%`** vs. MSE, **`-57.7%`** vs. collapsed `B=1024` (`32.73 px`); `B=64` hits **`83%`** |
+| **2D PushT Visual Waypoints** (`N=8` 2-stage, `1024` unrolls) | `50.0%` S1, `12.5%` handoff, `94.12 px` S2 | **`75.0%`** S1, **`37.5%`** handoff, **`70.89 px`** S2 | **`3x`** accurate latent handoff, zero privileged state |
+| **3D Sawyer `Push-v3` Audit** (`N=72` test, `N=12` bank) | `0.056` top-1, `0.517` AUROC, `3.15 cm` ACT regret | **`0.500`** top-1, **`0.917`** AUROC, **`2.19 cm`** ACT regret | **`9x`** retrieval, **`42x`** `2 cm` sensitivity, **`-30.5%`** ACT regret via ANOVA prior |
+| **3D Sawyer `Push-v3` Closed-Loop** (`N=12` test, `H=6`) | `4.47 cm` mean, `92%` $\le 5\text{ cm}$, `0%` $\le 3\text{ cm}$ | `6.89 cm` mean (`IQM 5.78`), **`17%` $\le 3\text{ cm}$** | Breaks MSE's `3 cm` precision ceiling while exposing free-space contact sparsity |
+
+### Visual Showcases & Spatial Anatomy
+
+![2D PushT Closed-Loop Duel: Plain MSE CEM vs. Calibrated Trust-MPC](docs/figures/pusht_studio_duel.gif)
+
+![2D PushT 2-Stage Visual Waypoint Chaining Demo](docs/figures/pusht_waypoint_demo.gif)
+
+![3D Meta-World Sawyer Push-v3 Spatial Anatomy: Border-Token Shortcut vs. Closed-Form ANOVA Prior](docs/figures/spatial_anatomy_comparison.png)
+
 ## Repository Layout
 
 ```text

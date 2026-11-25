@@ -345,7 +345,7 @@ def plot_closed_loop_forest(
     n_right = len(paired_contrasts)
     height = max(3.9, 0.56 * max(n_left, n_right, 3) + 1.65)
 
-    fig = Figure(figsize=(11.8, height), dpi=dpi, facecolor=tokens["surface"])
+    fig = Figure(figsize=(15.8, height), dpi=dpi, facecolor=tokens["surface"])
     ax_abs, ax_diff = fig.subplots(1, 2, gridspec_kw={"width_ratios": [1.05, 1.0]})
     _style_axes(ax_abs, tokens, grid_axis="x")
     _style_axes(ax_diff, tokens, grid_axis="x")
@@ -430,8 +430,8 @@ def plot_closed_loop_forest(
 
     ax_abs.set_yticks(y_abs)
     ax_abs.set_yticklabels(abs_labels, fontsize=8.8, color=tokens["ink"])
-    ax_abs.set_ylim(-0.7, n_left - 0.3)
-    ax_abs.set_xlim(min(0.0, abs_lo_min - 0.05 * span_abs), abs_hi_max + 0.28 * span_abs)
+    ax_abs.set_ylim(-1.05, n_left - 0.3)
+    ax_abs.set_xlim(min(0.0, abs_lo_min - 0.05 * span_abs), abs_hi_max + 0.36 * span_abs)
     abs_metric = metric_label or ("Final 3D puck error" if unit == "cm" else "Final T position error")
     ax_abs.set_xlabel(f"{abs_metric} ({unit}), lower is better", fontsize=9.2)
     ax_abs.set_title("A. Closed-loop error (mean ± 95% CI, IQM)", loc="left", fontsize=10.2, fontweight="bold")
@@ -572,7 +572,7 @@ def plot_closed_loop_forest(
         fontsize=8.2,
         color=tokens["ink_muted"],
     )
-    fig.subplots_adjust(left=0.22, right=0.98, top=0.84, bottom=0.17, wspace=0.48)
+    fig.subplots_adjust(left=0.24, right=0.985, top=0.84, bottom=0.17, wspace=0.92)
     _save_figure(fig, output_path, dpi=dpi, also_pdf=also_pdf)
     return fig
 

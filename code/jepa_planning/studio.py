@@ -363,7 +363,11 @@ def _encode_patch_features(model, rgb: np.ndarray, proprio: np.ndarray) -> torch
     proprio_t = torch.from_numpy(np.asarray(proprio, dtype=np.float32))[None, None]
     with torch.inference_mode():
         encoded = model.encode({"visual": visual, "proprio": proprio_t})
-    vis = encoded["visual"] if isinstance(encoded, dict) else encoded
+    vis = (
+        encoded["visual"]
+        if isinstance(encoded, dict) or (hasattr(encoded, "keys") and "visual" in encoded.keys())
+        else encoded
+    )
     if vis.ndim >= 4:
         vis = vis[0, -1]
     elif vis.ndim == 3:
@@ -1290,14 +1294,14 @@ class MetaWorldStudioSession:
         env=None,
         *,
         spatial_weights: dict[str, torch.Tensor | None] | None = None,
-        warmup_steps: int = 15,
-        goal_steps: int = 25,
+        warmup_steps: int = 40,
+        goal_steps: int = 30,
         controls_per_chunk: int = 5,
         cem_samples: int = 64,
         cem_elites: int = 8,
         cem_iterations: int = 2,
         batch_size: int = 32,
-        stay_margin: float = 0.02,
+        stay_margin: float = 0.0,
         dual_certify: bool = True,
         default_head: str | None = None,
     ) -> None:
@@ -1762,6 +1766,7 @@ class MetaWorldStudioSession:
                     stay_margin=self.stay_margin,
                     dual_certify=self.dual_certify,
                     spatial_weights=spatial_weights,
+                    sample_around_prior=True,
                 )
                 raw_mode_cost = float(plan_info["mode_mean_cost"])
                 extra_diag = {

@@ -30,6 +30,7 @@ from jepa_planning.studio import (
 from jepa_planning.waypoint_mpc import (
     WaypointTracker,
     compose_waypoint_gif_bytes,
+    encode_visual_features,
     waypoint_trust_mpc_step,
 )
 
@@ -572,3 +573,54 @@ def test_demo_cli_tasks_paired_suite_and_studio_waypoint_endpoint(tmp_path):
         server.server_close()
         thread.join(timeout=5)
         backend.close()
+
+
+class _TensorDictLike:
+    """Minimal non-dict mapping container mirroring tensordict.TensorDict."""
+
+    def __init__(self, data: dict[str, torch.Tensor]) -> None:
+        self._data = data
+
+    def keys(self):
+        return self._data.keys()
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._data[key]
+
+
+def test_encode_visual_features_handles_tensordict_like_with_and_without_proprio():
+    """encode_visual_features unpacks non-dict .keys()/__getitem__ outputs with or without proprio."""
+    recorded_inputs: list[object] = []
+    expected_tokens = torch.arange(256 * 12, dtype=torch.float32).reshape(256, 12)
+
+    class _TensorDictModel:
+        def encode(self, inp):
+            recorded_inputs.append(inp)
+            return _TensorDictLike({"visual": expected_tokens[None, None].clone()})
+
+    model = _TensorDictModel()
+    rgb = np.zeros((224, 224, 3), dtype=np.uint8)
+
+    # Case 1: observation includes proprio -> passes dict {"visual", "proprio"} to model.encode.
+    out_with_proprio = encode_visual_features(
+        model,
+        {"visual": rgb, "proprio": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)},
+    )
+    assert isinstance(recorded_inputs[0], dict)
+    assert set(recorded_inputs[0].keys()) == {"visual", "proprio"}
+    assert out_with_proprio.shape == (256, 12)
+    assert out_with_proprio.dtype == torch.float32
+    torch.testing.assert_close(out_with_proprio, expected_tokens)
+
+    # Case 2: observation omits proprio -> passes raw visual tensor to model.encode.
+    out_no_proprio = encode_visual_features(model, {"visual": rgb})
+    assert isinstance(recorded_inputs[1], torch.Tensor)
+    assert tuple(recorded_inputs[1].shape) == (1, 1, 3, 224, 224)
+    assert out_no_proprio.shape == (256, 12)
+    torch.testing.assert_close(out_no_proprio, expected_tokens)
+
+    # Case 3: observation has proprio=None -> also passes raw visual tensor.
+    out_none_proprio = encode_visual_features(model, {"visual": rgb, "proprio": None})
+    assert isinstance(recorded_inputs[2], torch.Tensor)
+    torch.testing.assert_close(out_none_proprio, expected_tokens)
+
