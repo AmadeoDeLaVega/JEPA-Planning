@@ -68,6 +68,13 @@ The learned temporal cost replaces feature similarity with predicted steps to
 the goal, trained from trajectory frame gaps. See `docs/pusht_temporal_cost.md`
 for the motivation, method, commands, and results.
 
+The follow-up goal-count saturation study extends the fixed-bank comparison to
+16 and 32 equivalent goal photographs. On 150 new tasks, regret improved from
+6.692 with one goal to 4.506 with four, but 8, 16, and 32 goals did not provide
+reliable incremental gains over the preceding count. Prototype and ranking
+convergence continued, showing that four goals are the practical knee for this
+task distribution. See `docs/pusht_goal_count_saturation.md`.
+
 The closed-loop Meta-World Push baseline runs through
 `code/experiments/run_baseline.py`. Its protocol, commands, outputs, and tests
 are documented in `docs/reproduction.md`.

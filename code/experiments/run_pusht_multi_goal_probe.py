@@ -204,6 +204,7 @@ def generate_action_bank(config: dict, action_mean: np.ndarray, action_std: np.n
         "candidate_poses": np.stack(candidate_poses),
         "goal_frames": goal_frames,
         "goal_proprioception": goal_proprioception,
+        "goal_states": np.stack(goal_states),
         "goal_poses": np.stack(goal_poses),
     }
 

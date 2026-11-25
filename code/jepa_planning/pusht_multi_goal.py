@@ -14,6 +14,7 @@ checkpoint or constructing a PushT environment.
 from __future__ import annotations
 
 from itertools import combinations
+from math import comb
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -101,6 +102,48 @@ def goal_subsets(total_goals: int, goal_counts: Sequence[int]) -> list[tuple[int
     return [subset for count in counts for subset in combinations(range(total_goals), count)]
 
 
+def sampled_goal_subsets(
+    total_goals: int,
+    goal_counts: Sequence[int],
+    max_subsets_per_count: int,
+    seed: int,
+) -> list[tuple[int, ...]]:
+    """Return deterministic, approximately uniform subsets without enumeration.
+
+    Every subset is retained when its count has at most
+    ``max_subsets_per_count`` combinations. Larger families are sampled by
+    drawing goal indices without replacement; this is uniform over subsets.
+    A separate RNG stream per goal count makes results stable if another count
+    is added to the experiment later.
+    """
+    if total_goals < 1:
+        raise ValueError("total_goals must be positive")
+    counts = tuple(goal_counts)
+    if not counts or any(type(count) is not int or not 1 <= count <= total_goals for count in counts):
+        raise ValueError("goal counts must be integers between one and total_goals")
+    if len(set(counts)) != len(counts):
+        raise ValueError("goal counts must not contain duplicates")
+    if type(max_subsets_per_count) is not int or max_subsets_per_count < 1:
+        raise ValueError("max_subsets_per_count must be a positive integer")
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("seed must be a uint32 integer")
+
+    output: list[tuple[int, ...]] = []
+    for count in counts:
+        available = comb(total_goals, count)
+        if available <= max_subsets_per_count:
+            selected = list(combinations(range(total_goals), count))
+        else:
+            rng = np.random.default_rng(np.random.SeedSequence([seed, total_goals, count]))
+            sampled: set[tuple[int, ...]] = set()
+            while len(sampled) < max_subsets_per_count:
+                subset = tuple(sorted(rng.choice(total_goals, size=count, replace=False).tolist()))
+                sampled.add(subset)
+            selected = sorted(sampled)
+        output.extend(selected)
+    return output
+
+
 def selection_record(
     costs: np.ndarray,
     candidate_poses: np.ndarray,
@@ -150,6 +193,58 @@ def evaluate_goal_counts(
                 "goal_count": len(subset),
                 "goal_subset": ";".join(str(index) for index in subset),
                 **selection_record(costs, candidate_poses, goal_pose),
+            }
+        )
+    return records
+
+
+def evaluate_goal_count_saturation(
+    candidate_features: torch.Tensor,
+    goal_features: torch.Tensor,
+    candidate_poses: np.ndarray,
+    goal_pose: np.ndarray,
+    goal_counts: Sequence[int],
+    max_subsets_per_count: int,
+    subset_seed: int,
+) -> list[dict[str, object]]:
+    """Evaluate goal-count scaling relative to the full goal prototype.
+
+    Physical metrics are computed for every sampled subset. Three additional
+    diagnostics measure convergence to the full goal pool: prototype MSE,
+    candidate-cost rank correlation, and selected-action agreement.
+    """
+    if len(candidate_features) != len(candidate_poses):
+        raise ValueError("candidate features and poses must have the same length")
+    if len(goal_features) < 1:
+        raise ValueError("goal features must not be empty")
+
+    subsets = sampled_goal_subsets(
+        len(goal_features), goal_counts, max_subsets_per_count, subset_seed
+    )
+    pairwise = pairwise_squared_goal_distance(candidate_features, goal_features)
+    full_costs = pairwise.mean(dim=1).detach().cpu().numpy()
+    full_selected = int(np.argmin(full_costs))
+    full_prototype = goal_features.mean(dim=0)
+
+    records: list[dict[str, object]] = []
+    for subset in subsets:
+        subset_costs = pairwise[:, subset].mean(dim=1).detach().cpu().numpy()
+        subset_prototype = goal_features[list(subset)].mean(dim=0)
+        prototype_mse = torch.mean((subset_prototype - full_prototype).square()).item()
+        if np.ptp(subset_costs) == 0 or np.ptp(full_costs) == 0:
+            cost_correlation = 0.0
+        else:
+            cost_correlation = spearmanr(subset_costs, full_costs).statistic
+            cost_correlation = float(cost_correlation) if np.isfinite(cost_correlation) else 0.0
+        outcome = selection_record(subset_costs, candidate_poses, goal_pose)
+        records.append(
+            {
+                "goal_count": len(subset),
+                "goal_subset": ";".join(str(index) for index in subset),
+                "prototype_mse_to_full": float(prototype_mse),
+                "cost_rank_correlation_to_full": cost_correlation,
+                "selection_matches_full": int(outcome["selected"] == full_selected),
+                **outcome,
             }
         )
     return records
