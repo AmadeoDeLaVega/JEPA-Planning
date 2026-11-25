@@ -30,6 +30,12 @@ from jepa_planning import pusht_head_planning as hp
 from jepa_planning import trust_mpc as tm
 from jepa_planning.calibrated_objectives import patch_energy_map
 from jepa_planning.pusht_multi_goal import cem_standard_normals, state_from
+from jepa_planning.waypoint_mpc import (
+    WaypointTracker,
+    compose_waypoint_gif_bytes,
+    encode_visual_features,
+    waypoint_trust_mpc_step,
+)
 
 # --------------------------------------------------------------------- presets
 
@@ -80,6 +86,45 @@ PUSHT_PRESETS: list[dict[str, object]] = [
         "goal_block": [256.0, 256.0, 0.78],
         "replans": 4,
         "seed": 20261124,
+    },
+]
+
+PUSHT_WAYPOINT_PRESETS: list[dict[str, object]] = [
+    {
+        "id": "corner_waypoint_chain",
+        "name": "L-Turn Corner Chain",
+        "description": (
+            "Two-stage around-the-corner push with independent distractor pushers "
+            "in each subgoal photo. Tests purely visual Stage 1 -> Stage 2 handoff "
+            "and warm-start reset without simulator coordinates."
+        ),
+        "initial_agent": [145.0, 355.0],
+        "initial_block": [210.0, 315.0, 0.25],
+        "waypoints": [
+            {"block": [255.0, 265.0, 0.65], "goal_agent": [425.0, 105.0]},
+            {"block": [315.0, 285.0, 1.15], "goal_agent": [95.0, 115.0]},
+        ],
+        "replans": 6,
+        "arrival_ratio": 0.35,
+        "seed": 20261124,
+    },
+    {
+        "id": "distractor_relay_chain",
+        "name": "Distractor Relay Chain",
+        "description": (
+            "Stage 1 and Stage 2 place distractor pushers in opposite corners so "
+            "plain MSE stalls chasing the Stage-1 distractor while the calibrated "
+            "head hands off smoothly to Stage 2."
+        ),
+        "initial_agent": [370.0, 360.0],
+        "initial_block": [305.0, 305.0, 2.40],
+        "waypoints": [
+            {"block": [256.0, 256.0, 1.85], "goal_agent": [95.0, 415.0]},
+            {"block": [205.0, 200.0, 1.25], "goal_agent": [420.0, 95.0]},
+        ],
+        "replans": 6,
+        "arrival_ratio": 0.35,
+        "seed": 20261125,
     },
 ]
 
@@ -497,6 +542,7 @@ class PushTStudioSession:
 
         self._lock = threading.Lock()
         self._latest_duel_frames: tuple[list[np.ndarray], list[np.ndarray], np.ndarray] | None = None
+        self._latest_waypoint_gif_data: tuple[list[np.ndarray], list[np.ndarray], list[int], str] | None = None
 
     def close(self) -> None:
         """Release simulator resources owned by this session."""
@@ -879,6 +925,314 @@ class PushTStudioSession:
             baseline_rgb, trust_rgb, goal_rgb = self._latest_duel_frames
         return compose_duel_gif_bytes(baseline_rgb, trust_rgb, goal_rgb, fps=fps)
 
+    def run_waypoint_chain(
+        self,
+        initial_agent: Sequence[float],
+        initial_block: Sequence[float],
+        waypoints: Sequence[dict[str, Sequence[float]]],
+        head_name: str | None = None,
+        replans: int = 6,
+        arrival_ratio: float = 0.35,
+        seed: int = 20261124,
+        stage1_threshold_px: float = 35.0,
+    ) -> dict[str, object]:
+        """Run paired multi-stage visual waypoint chain episodes under exact rollout parity."""
+        if isinstance(replans, bool) or not isinstance(replans, int) or not 1 <= replans <= 24:
+            raise ValueError("replans must be an integer between 1 and 24")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        if isinstance(arrival_ratio, bool) or not math.isfinite(float(arrival_ratio)):
+            raise ValueError("arrival_ratio must be a finite number in [0, 1]")
+        if not 0.0 <= float(arrival_ratio) <= 1.0:
+            raise ValueError("arrival_ratio must lie in [0, 1]")
+        if not waypoints or len(waypoints) < 2:
+            raise ValueError("waypoints must contain at least 2 subgoal entries")
+
+        resolved_name, head_matrix = self._resolve_head(head_name)
+        init_agent_arr = np.asarray(initial_agent, dtype=np.float32)
+        init_block_arr = np.asarray(initial_block, dtype=np.float32)
+        if init_agent_arr.shape != (2,) or init_block_arr.shape != (3,):
+            raise ValueError("initial_agent must have shape [2] and initial_block must have shape [3]")
+
+        initial_state = state_from(
+            np.clip(init_agent_arr, 30.0, 482.0),
+            np.array(
+                [
+                    float(np.clip(init_block_arr[0], 70.0, 442.0)),
+                    float(np.clip(init_block_arr[1], 70.0, 442.0)),
+                    float(init_block_arr[2] % (2.0 * np.pi)),
+                ],
+                dtype=np.float32,
+            ),
+        )
+
+        waypoint_poses: list[tuple[np.ndarray, np.ndarray]] = []
+        for idx, entry in enumerate(waypoints):
+            if not isinstance(entry, dict) or "block" not in entry or "goal_agent" not in entry:
+                raise ValueError(f"waypoints[{idx}] must be an object with 'block' and 'goal_agent'")
+            wp_agent = np.clip(np.asarray(entry["goal_agent"], dtype=np.float32), 30.0, 482.0)
+            wp_block_raw = np.asarray(entry["block"], dtype=np.float32)
+            if wp_agent.shape != (2,) or wp_block_raw.shape != (3,):
+                raise ValueError(f"waypoints[{idx}] must specify goal_agent [2] and block [3]")
+            wp_block = np.array(
+                [
+                    float(np.clip(wp_block_raw[0], 70.0, 442.0)),
+                    float(np.clip(wp_block_raw[1], 70.0, 442.0)),
+                    float(wp_block_raw[2] % (2.0 * np.pi)),
+                ],
+                dtype=np.float64,
+            )
+            waypoint_poses.append((wp_agent, wp_block))
+
+        hold_chunk = tm.zero_displacement_chunk(
+            self.action_mean, self.action_std, self.controls_per_chunk, self.action_clip
+        )
+        identity_head = self.heads["identity"]
+
+        with self._lock:
+            waypoint_rgbs: list[np.ndarray] = []
+            waypoint_features: list[torch.Tensor] = []
+            for wp_agent, wp_block in waypoint_poses:
+                wp_rgb, wp_prop = self._render_pusht_pose_unlocked(wp_agent, wp_block)
+                waypoint_rgbs.append(wp_rgb)
+                waypoint_features.append(_encode_patch_features(self.model, wp_rgb, wp_prop))
+
+            shared_normals = [
+                cem_standard_normals(
+                    seed,
+                    0,
+                    replan_idx,
+                    self.cem_iterations,
+                    self.cem_samples,
+                    self.cem_horizon,
+                    self.action_dim,
+                )
+                for replan_idx in range(replans)
+            ]
+
+            target_blocks = [wp_block for _, wp_block in waypoint_poses]
+            baseline_result, _, _ = self._run_single_waypoint_episode_unlocked(
+                initial_state=initial_state,
+                waypoint_blocks=target_blocks,
+                waypoint_features=waypoint_features,
+                head=identity_head,
+                planner="standard_cem",
+                shared_normals=shared_normals,
+                hold_chunk=hold_chunk,
+                arrival_ratio=float(arrival_ratio),
+                stage1_threshold_px=float(stage1_threshold_px),
+            )
+            trust_result, trust_rgb, trust_frame_stages = self._run_single_waypoint_episode_unlocked(
+                initial_state=initial_state,
+                waypoint_blocks=target_blocks,
+                waypoint_features=waypoint_features,
+                head=head_matrix,
+                planner="waypoint_trust_mpc",
+                shared_normals=shared_normals,
+                hold_chunk=hold_chunk,
+                arrival_ratio=float(arrival_ratio),
+                stage1_threshold_px=float(stage1_threshold_px),
+            )
+            self._latest_waypoint_gif_data = (
+                trust_rgb,
+                waypoint_rgbs,
+                trust_frame_stages,
+                f"Trust-MPC ({resolved_name})",
+            )
+
+        return {
+            "head_name": resolved_name,
+            "effective_rank": float(tm.effective_rank(head_matrix)),
+            "replans": replans,
+            "controls_per_chunk": self.controls_per_chunk,
+            "arrival_ratio": float(arrival_ratio),
+            "seed": seed,
+            "num_waypoints": len(waypoint_rgbs),
+            "waypoint_images": [encode_png_base64(img) for img in waypoint_rgbs],
+            "baseline": baseline_result,
+            "trust_mpc": trust_result,
+            "gif_ready": True,
+        }
+
+    def _run_single_waypoint_episode_unlocked(
+        self,
+        *,
+        initial_state: np.ndarray,
+        waypoint_blocks: list[np.ndarray],
+        waypoint_features: list[torch.Tensor],
+        head: torch.Tensor,
+        planner: str,
+        shared_normals: list[np.ndarray],
+        hold_chunk: np.ndarray,
+        arrival_ratio: float,
+        stage1_threshold_px: float,
+    ) -> tuple[dict[str, object], list[np.ndarray], list[int]]:
+        self.env.reset_to_state = initial_state.copy()
+        observation, _ = self.env.reset()
+
+        first_rgb = _as_rgb_uint8(observation["visual"]).copy()
+        raw_frames: list[np.ndarray] = [first_rgb]
+        encoded_frames: list[str] = [encode_png_base64(first_rgb)]
+        frame_stages: list[int] = [0]
+
+        tracker = WaypointTracker(
+            waypoint_features,
+            head.to(device=self.model.device, dtype=torch.float32),
+            arrival_ratio=arrival_ratio,
+            allow_stay_gate_advance=(planner == "waypoint_trust_mpc"),
+        )
+
+        stage1_pose = waypoint_blocks[0]
+        final_pose = waypoint_blocks[-1]
+        cur_block_pose = initial_state[2:5].astype(np.float64)
+        best_stage1_err = float(hp.physical_metrics(cur_block_pose[None, :], stage1_pose)["position_error"][0])
+        best_final_err = float(hp.physical_metrics(cur_block_pose[None, :], final_pose)["position_error"][0])
+        final_metrics = {
+            k: float(v[0]) for k, v in hp.physical_metrics(cur_block_pose[None, :], final_pose).items()
+        }
+
+        handoff_step: int | None = None
+        handoff_stage1_err: float | None = None
+        replan_telemetry: list[dict[str, object]] = []
+        previous_plan: np.ndarray | None = None
+        total_unrolls = 0
+        sim_steps = 0
+
+        for replan_idx, normals in enumerate(shared_normals):
+            if planner == "standard_cem":
+                current_features = encode_visual_features(self.model, observation)
+                t_info = tracker.update(current_features, used_stay_gate=False)
+                action_chunk, p_info = standard_cem_plan(
+                    self.model,
+                    observation,
+                    tracker.active_waypoint,
+                    head,
+                    normals,
+                    num_elites=self.cem_elites,
+                    action_clip=self.action_clip,
+                    batch_size=self.batch_size,
+                )
+                step_diag: dict[str, object] = {
+                    **p_info,
+                    **t_info,
+                    "jensen_violation": False,
+                    "used_stay_gate": False,
+                    "warm_start_reset": bool(t_info["advanced"]),
+                }
+            else:
+                action_chunk, previous_plan, step_diag = waypoint_trust_mpc_step(
+                    self.model,
+                    observation,
+                    tracker,
+                    normals,
+                    hold_chunk,
+                    previous_plan,
+                    num_elites=self.cem_elites,
+                    action_clip=self.action_clip,
+                    batch_size=self.batch_size,
+                    stay_margin=self.stay_margin,
+                    certify_barrier_split=True,
+                )
+
+            if step_diag["advanced"] and handoff_step is None:
+                handoff_step = replan_idx
+                handoff_stage1_err = float(
+                    hp.physical_metrics(cur_block_pose[None, :], stage1_pose)["position_error"][0]
+                )
+
+            total_unrolls += int(step_diag["unrolls"])
+            active_stage = int(tracker.stage_index)
+            for control in action_chunk.reshape(self.controls_per_chunk, 2):
+                raw_action = control * self.action_std + self.action_mean
+                observation, _, _, step_info = self.env.step(raw_action)
+                sim_steps += 1
+                frame = _as_rgb_uint8(observation["visual"]).copy()
+                raw_frames.append(frame)
+                encoded_frames.append(encode_png_base64(frame))
+                frame_stages.append(active_stage)
+
+            cur_block_pose = np.asarray(step_info["state"], dtype=np.float64)[2:5]
+            s1_err = float(hp.physical_metrics(cur_block_pose[None, :], stage1_pose)["position_error"][0])
+            active_err = float(
+                hp.physical_metrics(cur_block_pose[None, :], waypoint_blocks[active_stage])["position_error"][0]
+            )
+            final_metrics = {
+                k: float(v[0]) for k, v in hp.physical_metrics(cur_block_pose[None, :], final_pose).items()
+            }
+            best_stage1_err = min(best_stage1_err, s1_err)
+            best_final_err = min(best_final_err, final_metrics["position_error"])
+
+            replan_telemetry.append(
+                {
+                    "replan": replan_idx + 1,
+                    "frame_index": len(raw_frames) - 1,
+                    "stage_index": active_stage,
+                    "advanced": bool(step_diag["advanced"]),
+                    "trigger": step_diag["trigger"],
+                    "cost_ratio": float(step_diag["cost_ratio"]),
+                    "warm_start_reset": bool(step_diag["warm_start_reset"]),
+                    "active_stage_error_px": active_err,
+                    "final_stage_error_px": final_metrics["position_error"],
+                    "jensen_violation": bool(step_diag.get("jensen_violation", False)),
+                    "used_stay_gate": bool(step_diag.get("used_stay_gate", False)),
+                    "unrolls": int(step_diag["unrolls"]),
+                }
+            )
+
+        handoff_triggered = handoff_step is not None
+        handoff_accurate = bool(
+            handoff_triggered
+            and handoff_stage1_err is not None
+            and handoff_stage1_err <= stage1_threshold_px
+        )
+        summary: dict[str, object] = {
+            "best_stage1_error_px": best_stage1_err,
+            "stage1_completed": bool(best_stage1_err <= stage1_threshold_px),
+            "handoff_triggered": handoff_triggered,
+            "handoff_step": handoff_step,
+            "handoff_stage1_error_px": handoff_stage1_err,
+            "handoff_accurate": handoff_accurate,
+            "final_stage_index": int(tracker.stage_index),
+            "final_position_error": final_metrics["position_error"],
+            "best_position_error": best_final_err,
+            "final_angle_error_deg": final_metrics["angle_error_deg"],
+            "final_combined_error": final_metrics["combined_error"],
+            "final_coverage": final_metrics["coverage"],
+            "success_20px": bool(final_metrics["success_20px"]),
+            "jensen_violations": int(sum(1 for r in replan_telemetry if r["jensen_violation"])),
+            "stay_gate_triggers": int(sum(1 for r in replan_telemetry if r["used_stay_gate"])),
+            "warm_start_resets": int(sum(1 for r in replan_telemetry if r["warm_start_reset"])),
+            "unrolls": int(total_unrolls),
+            "sim_steps": int(sim_steps),
+        }
+        return {
+            "planner": planner,
+            "frames": encoded_frames,
+            "frame_stages": frame_stages,
+            "replan_telemetry": replan_telemetry,
+            "transitions": list(tracker.transitions),
+            "summary": summary,
+        }, raw_frames, frame_stages
+
+    def has_latest_waypoint_gif(self) -> bool:
+        """Whether at least one multi-stage waypoint chain has been cached for GIF export."""
+        with self._lock:
+            return self._latest_waypoint_gif_data is not None
+
+    def get_latest_waypoint_gif_bytes(self, fps: int = 4) -> bytes:
+        """Encode the most recent multi-stage waypoint rollout as an animated GIF."""
+        with self._lock:
+            if self._latest_waypoint_gif_data is None:
+                raise LookupError("No waypoint chain has been executed yet")
+            rollout_rgb, waypoint_rgbs, frame_stages, title_prefix = self._latest_waypoint_gif_data
+        return compose_waypoint_gif_bytes(
+            rollout_rgb,
+            waypoint_rgbs,
+            frame_stages,
+            title_prefix=title_prefix,
+            fps=fps,
+        )
+
 
 # --------------------------------------------------------- Meta-World session
 
@@ -1091,6 +1445,7 @@ class PlanningStudioBackend:
                 "heads": _head_catalog_metadata(self.pusht.heads),
                 "default_head": self.pusht.default_head,
                 "presets": PUSHT_PRESETS,
+                "waypoint_presets": PUSHT_WAYPOINT_PRESETS,
                 "config": {
                     "controls_per_chunk": self.pusht.controls_per_chunk,
                     "cem_horizon": self.pusht.cem_horizon,
@@ -1100,6 +1455,7 @@ class PlanningStudioBackend:
                     "stay_margin": self.pusht.stay_margin,
                 },
                 "has_duel_gif": self.pusht.has_latest_duel_gif(),
+                "has_waypoint_gif": self.pusht.has_latest_waypoint_gif(),
             },
             "metaworld": {
                 "enabled": self.metaworld is not None,
@@ -1133,6 +1489,23 @@ class PlanningStudioBackend:
     def get_duel_gif_bytes(self, fps: int = 4) -> bytes:
         """Return the latest PushT duel as an animated GIF byte buffer."""
         return self.pusht.get_latest_duel_gif_bytes(fps=fps)
+
+    def run_pusht_waypoint_chain(self, payload: dict[str, object]) -> dict[str, object]:
+        """Validate a JSON request payload and run a paired multi-stage PushT waypoint chain."""
+        return self.pusht.run_waypoint_chain(
+            initial_agent=payload["initial_agent"],
+            initial_block=payload["initial_block"],
+            waypoints=payload["waypoints"],
+            head_name=payload.get("head_name"),
+            replans=int(payload.get("replans", 6)),
+            arrival_ratio=float(payload.get("arrival_ratio", 0.35)),
+            seed=int(payload.get("seed", 20261124)),
+            stage1_threshold_px=float(payload.get("stage1_threshold_px", 35.0)),
+        )
+
+    def get_waypoint_gif_bytes(self, fps: int = 4) -> bytes:
+        """Return the latest multi-stage waypoint chain as an animated GIF byte buffer."""
+        return self.pusht.get_latest_waypoint_gif_bytes(fps=fps)
 
     def inspect_metaworld(self, payload: dict[str, object]) -> dict[str, object]:
         """Run 3D Meta-World Sawyer Push-v3 inspection if enabled."""
@@ -1478,6 +1851,7 @@ STUDIO_HTML = """<!DOCTYPE html>
   <div class="header-controls">
     <div class="tabs">
       <button class="tab-btn active" data-tab="pusht">2D PushT Studio</button>
+      <button class="tab-btn" data-tab="waypoints">Multi-Stage Waypoint Chain</button>
       <button class="tab-btn" data-tab="metaworld">3D Sawyer Push-v3</button>
     </div>
     <label for="head-select" style="color: var(--muted); font-size: 12px;">Head</label>
@@ -1687,6 +2061,102 @@ STUDIO_HTML = """<!DOCTYPE html>
     </div>
   </section>
 
+  <!-- Multi-Stage Waypoint Chain Tab -->
+  <section id="tab-waypoints" class="hidden">
+    <div class="panel">
+      <div class="panel-title">
+        <span>Multi-Stage Waypoint Chain (Visual Latent Handoff)</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span id="wp-parity-badge" class="badge">unrolls: --</span>
+          <a id="btn-wp-download-gif" class="btn small emerald hidden" href="/api/waypoint.gif" download="waypoint_chain.gif">Download Waypoint GIF</a>
+        </div>
+      </div>
+      <div class="preset-row" id="wp-preset-buttons"></div>
+      <div id="wp-preset-desc" class="preset-desc">Select a 2-stage preset to compare purely visual latent handoff under Plain MSE vs. a calibrated head.</div>
+      <div class="mw-controls">
+        <div class="field">
+          <label for="wp-replans">Replans</label>
+          <input id="wp-replans" type="number" min="2" max="24" value="6" />
+        </div>
+        <div class="field">
+          <label for="wp-arrival-ratio">Arrival Ratio</label>
+          <input id="wp-arrival-ratio" type="number" step="0.05" min="0.05" max="0.95" value="0.35" />
+        </div>
+        <div class="field">
+          <label for="wp-seed">Shared Seed</label>
+          <input id="wp-seed" type="number" value="20261124" />
+        </div>
+        <button id="btn-wp-run" class="btn primary">Run Waypoint Chain Duel</button>
+      </div>
+      <div id="wp-status" class="status-line" style="margin-bottom:12px;">Ready.</div>
+
+      <div class="kpi-strip">
+        <div class="kpi">
+          <div class="kpi-label">Plain MSE Stage Handoff</div>
+          <div class="kpi-value" style="color:var(--crimson)" id="wp-mse-handoff">--</div>
+          <div class="kpi-sub" id="wp-mse-final">Stage-2 final --</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Trust-MPC Stage Handoff</div>
+          <div class="kpi-value" style="color:var(--emerald)" id="wp-trust-handoff">--</div>
+          <div class="kpi-sub" id="wp-trust-final">Stage-2 final --</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Warm-Start Resets</div>
+          <div class="kpi-value" style="color:var(--amber)" id="wp-resets">--</div>
+          <div class="kpi-sub">cleared on stage switch</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Stay-Gate / Jensen</div>
+          <div class="kpi-value" style="color:var(--blue)" id="wp-gates">--</div>
+          <div class="kpi-sub">stay / barrier splits</div>
+        </div>
+      </div>
+
+      <div class="duel-stage">
+        <div class="frame-card">
+          <img id="wp-img-subgoal" alt="Active subgoal photo" />
+          <div class="frame-caption"><span>Active Subgoal Photo</span><span id="wp-stage-badge" class="badge amber">Stage 1/2</span></div>
+        </div>
+        <div class="frame-card">
+          <img id="wp-img-base" alt="Plain MSE waypoint rollout" />
+          <div class="frame-caption"><span>Plain MSE + Waypoint CEM</span><span id="wp-cap-base">--</span></div>
+        </div>
+        <div class="frame-card">
+          <img id="wp-img-trust" alt="Calibrated Trust-MPC waypoint rollout" />
+          <div class="frame-caption"><span>Calibrated Head + Waypoint Trust-MPC</span><span id="wp-cap-trust">--</span></div>
+        </div>
+      </div>
+
+      <div class="scrubber-bar">
+        <button id="btn-wp-play" class="btn small" disabled>Play</button>
+        <input id="wp-scrubber" type="range" min="0" max="0" value="0" disabled />
+        <span id="wp-frame-label" class="status-line">Step 0 / 0</span>
+      </div>
+
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Replan</th>
+              <th>MSE Stage</th>
+              <th>Trust Stage</th>
+              <th>Cost Ratio</th>
+              <th>Warm Reset</th>
+              <th>Trust Stage-2 Err (px)</th>
+              <th>Jensen Gate</th>
+              <th>Stay Gate</th>
+              <th>Unrolls</th>
+            </tr>
+          </thead>
+          <tbody id="wp-telemetry-body">
+            <tr><td colspan="9" style="text-align:center;color:var(--muted);">Run a Multi-Stage Waypoint Chain duel to inspect latent handoff telemetry.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- 3D Meta-World Tab -->
   <section id="tab-metaworld" class="hidden">
     <div class="panel">
@@ -1783,6 +2253,8 @@ STUDIO_HTML = """<!DOCTYPE html>
   const state = {
     heads: [],
     presets: [],
+    waypoint_presets: [],
+    active_waypoint_preset: null,
     cur_agent: [145, 340],
     cur_block: [230, 290, 0.35],
     goal_agent: [435, 95],
@@ -1791,6 +2263,9 @@ STUDIO_HTML = """<!DOCTYPE html>
     duel: null,
     playTimer: null,
     frameIdx: 0,
+    waypointChain: null,
+    wpPlayTimer: null,
+    wpFrameIdx: 0,
   };
 
   function toCanvas(v) { return (v / ARENA) * canvas.width; }
@@ -1923,6 +2398,7 @@ STUDIO_HTML = """<!DOCTYPE html>
       btn.classList.add("active");
       const target = btn.dataset.tab;
       document.getElementById("tab-pusht").classList.toggle("hidden", target !== "pusht");
+      document.getElementById("tab-waypoints").classList.toggle("hidden", target !== "waypoints");
       document.getElementById("tab-metaworld").classList.toggle("hidden", target !== "metaworld");
     });
   });
@@ -2117,6 +2593,129 @@ STUDIO_HTML = """<!DOCTYPE html>
     }, 240);
   });
 
+  // Multi-Stage Waypoint Chain
+  function applyWaypointPreset(preset) {
+    state.active_waypoint_preset = preset;
+    document.getElementById("wp-replans").value = preset.replans;
+    document.getElementById("wp-arrival-ratio").value = preset.arrival_ratio;
+    document.getElementById("wp-seed").value = preset.seed;
+    document.getElementById("wp-preset-desc").textContent = preset.description;
+  }
+
+  function showWaypointFrame(idx) {
+    if (!state.waypointChain) return;
+    const data = state.waypointChain;
+    const maxIdx = Math.max(0, data.trust_mpc.frames.length - 1);
+    state.wpFrameIdx = Math.max(0, Math.min(maxIdx, idx));
+    const stageIdx = data.trust_mpc.frame_stages[state.wpFrameIdx] || 0;
+    document.getElementById("wp-img-subgoal").src = data.waypoint_images[stageIdx];
+    document.getElementById("wp-stage-badge").textContent = `Stage ${stageIdx + 1}/${data.num_waypoints}`;
+    document.getElementById("wp-img-base").src = data.baseline.frames[state.wpFrameIdx];
+    document.getElementById("wp-img-trust").src = data.trust_mpc.frames[state.wpFrameIdx];
+    document.getElementById("wp-scrubber").value = state.wpFrameIdx;
+    document.getElementById("wp-frame-label").textContent = `Step ${state.wpFrameIdx} / ${maxIdx}`;
+  }
+
+  function stopWaypointPlayback() {
+    if (state.wpPlayTimer) { clearInterval(state.wpPlayTimer); state.wpPlayTimer = null; }
+    document.getElementById("btn-wp-play").textContent = "Play";
+  }
+
+  async function runWaypointChain() {
+    if (!state.active_waypoint_preset) return;
+    stopWaypointPlayback();
+    const status = document.getElementById("wp-status");
+    const btn = document.getElementById("btn-wp-run");
+    btn.disabled = true;
+    status.textContent = "Running paired Multi-Stage Waypoint Chain...";
+    try {
+      const preset = state.active_waypoint_preset;
+      const resp = await fetch("/api/waypoint_chain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          initial_agent: preset.initial_agent,
+          initial_block: preset.initial_block,
+          waypoints: preset.waypoints,
+          head_name: document.getElementById("head-select").value,
+          replans: Number(document.getElementById("wp-replans").value),
+          arrival_ratio: Number(document.getElementById("wp-arrival-ratio").value),
+          seed: Number(document.getElementById("wp-seed").value),
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "Waypoint chain request failed");
+
+      state.waypointChain = data;
+      const bSum = data.baseline.summary;
+      const tSum = data.trust_mpc.summary;
+      document.getElementById("wp-mse-handoff").textContent = bSum.handoff_triggered ? `Step ${bSum.handoff_step + 1}` : "STALLED";
+      document.getElementById("wp-mse-final").textContent = `Stage-2 final ${fmt(bSum.final_position_error, 1)} px`;
+      document.getElementById("wp-trust-handoff").textContent = tSum.handoff_triggered ? `Step ${tSum.handoff_step + 1}` : "STALLED";
+      document.getElementById("wp-trust-final").textContent = `Stage-2 final ${fmt(tSum.final_position_error, 1)} px`;
+      document.getElementById("wp-resets").textContent = `${tSum.warm_start_resets}`;
+      document.getElementById("wp-gates").textContent = `${tSum.stay_gate_triggers} / ${tSum.jensen_violations}`;
+      document.getElementById("wp-parity-badge").textContent = `unrolls: ${bSum.unrolls} vs ${tSum.unrolls}`;
+      document.getElementById("wp-cap-base").textContent = `final ${fmt(bSum.final_position_error, 1)} px`;
+      document.getElementById("wp-cap-trust").textContent = `final ${fmt(tSum.final_position_error, 1)} px`;
+
+      const maxIdx = Math.max(0, data.trust_mpc.frames.length - 1);
+      const scrubber = document.getElementById("wp-scrubber");
+      scrubber.max = maxIdx;
+      scrubber.disabled = false;
+      document.getElementById("btn-wp-play").disabled = false;
+      const dl = document.getElementById("btn-wp-download-gif");
+      dl.classList.remove("hidden");
+      dl.href = `/api/waypoint.gif?ts=${Date.now()}`;
+      showWaypointFrame(maxIdx);
+
+      const tbody = document.getElementById("wp-telemetry-body");
+      tbody.innerHTML = "";
+      for (let i = 0; i < data.trust_mpc.replan_telemetry.length; i++) {
+        const bRow = data.baseline.replan_telemetry[i];
+        const tRow = data.trust_mpc.replan_telemetry[i];
+        const tr = document.createElement("tr");
+        const resetBadge = tRow.warm_start_reset ? '<span class="badge amber">RESET</span>' : '<span class="badge">KEEP</span>';
+        const jensenBadge = tRow.jensen_violation ? '<span class="badge crimson">SPLIT</span>' : '<span class="badge">UNIMODAL</span>';
+        const stayBadge = tRow.used_stay_gate ? '<span class="badge emerald">HOLD</span>' : '<span class="badge">MOVE</span>';
+        tr.innerHTML = `
+          <td>#${tRow.replan}</td>
+          <td>Stage ${bRow.stage_index + 1}</td>
+          <td>Stage ${tRow.stage_index + 1}</td>
+          <td>${fmt(tRow.cost_ratio, 3)}</td>
+          <td>${resetBadge}</td>
+          <td>${fmt(tRow.final_stage_error_px, 1)}</td>
+          <td>${jensenBadge}</td>
+          <td>${stayBadge}</td>
+          <td>${tRow.unrolls}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+      status.textContent = "Multi-Stage Waypoint Chain complete.";
+    } catch (err) {
+      status.textContent = `Error: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById("btn-wp-run").addEventListener("click", runWaypointChain);
+  document.getElementById("wp-scrubber").addEventListener("input", (e) => {
+    stopWaypointPlayback();
+    showWaypointFrame(Number(e.target.value));
+  });
+  document.getElementById("btn-wp-play").addEventListener("click", () => {
+    if (!state.waypointChain) return;
+    if (state.wpPlayTimer) { stopWaypointPlayback(); return; }
+    const maxIdx = state.waypointChain.trust_mpc.frames.length - 1;
+    if (state.wpFrameIdx >= maxIdx) showWaypointFrame(0);
+    document.getElementById("btn-wp-play").textContent = "Pause";
+    state.wpPlayTimer = setInterval(() => {
+      if (state.wpFrameIdx >= maxIdx) { stopWaypointPlayback(); return; }
+      showWaypointFrame(state.wpFrameIdx + 1);
+    }, 240);
+  });
+
   // 3D Meta-World inspection
   document.getElementById("btn-mw-inspect").addEventListener("click", async () => {
     const mwStatus = document.getElementById("mw-status");
@@ -2163,6 +2762,7 @@ STUDIO_HTML = """<!DOCTYPE html>
     const info = await resp.json();
     state.heads = info.pusht.heads;
     state.presets = info.pusht.presets;
+    state.waypoint_presets = info.pusht.waypoint_presets || [];
 
     const headSelect = document.getElementById("head-select");
     headSelect.innerHTML = "";
@@ -2185,6 +2785,17 @@ STUDIO_HTML = """<!DOCTYPE html>
       presetRow.appendChild(btn);
     }
     if (state.presets.length > 0) applyPreset(state.presets[0]);
+
+    const wpPresetRow = document.getElementById("wp-preset-buttons");
+    wpPresetRow.innerHTML = "";
+    for (const wpPreset of state.waypoint_presets) {
+      const btn = document.createElement("button");
+      btn.className = "btn small";
+      btn.textContent = wpPreset.name;
+      btn.addEventListener("click", () => applyWaypointPreset(wpPreset));
+      wpPresetRow.appendChild(btn);
+    }
+    if (state.waypoint_presets.length > 0) applyWaypointPreset(state.waypoint_presets[0]);
 
     const mwBadge = document.getElementById("mw-status-badge");
     if (info.metaworld.enabled) {
@@ -2302,6 +2913,26 @@ def create_studio_server(
                 )
                 return
 
+            if route == "/api/waypoint.gif":
+                query = parse_qs(parsed.query)
+                fps_raw = query.get("fps", ["4"])[0]
+                try:
+                    fps = int(fps_raw)
+                    gif_bytes = backend.get_waypoint_gif_bytes(fps=fps)
+                except LookupError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    gif_bytes,
+                    "image/gif",
+                    extra_headers={"Content-Disposition": 'attachment; filename="waypoint_chain.gif"'},
+                )
+                return
+
             self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {route}"})
 
         def do_POST(self) -> None:  # noqa: N802
@@ -2312,6 +2943,8 @@ def create_studio_server(
                     self._send_json(HTTPStatus.OK, backend.inspect_pusht(payload))
                 elif route == "/api/duel":
                     self._send_json(HTTPStatus.OK, backend.run_pusht_duel(payload))
+                elif route == "/api/waypoint_chain":
+                    self._send_json(HTTPStatus.OK, backend.run_pusht_waypoint_chain(payload))
                 elif route == "/api/metaworld_inspect":
                     self._send_json(HTTPStatus.OK, backend.inspect_metaworld(payload))
                 else:
