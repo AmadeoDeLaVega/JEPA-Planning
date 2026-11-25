@@ -18,6 +18,10 @@ import pytest
 import torch
 
 from jepa_planning import linear_head as lh
+from jepa_planning.spatial_channel_head import (
+    SpatialChannelGoalHead,
+    save_spatial_channel_head,
+)
 from jepa_planning.studio import (
     MetaWorldStudioSession,
     PlanningStudioBackend,
@@ -26,6 +30,7 @@ from jepa_planning.studio import (
     create_studio_server,
     encode_png_base64,
     load_heads_directory,
+    load_spatial_heads_directory,
     render_patch_heatmap_overlay,
 )
 
@@ -558,4 +563,64 @@ def test_load_heads_directory_and_cli_parser(tmp_path):
     assert args.export_demo_gif == tmp_path / "out.gif"
     assert args.export_metaworld_gif == tmp_path / "mw_out.gif"
     assert args.metaworld_heads_dir.name == "metaworld_calibrated_heads"
+
+
+def test_spatial_channel_head_loading_heatmap_and_metaworld_session(tmp_path):
+    if sys.platform == "darwin":
+        os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    saved_head = _structure_head(16)
+    spatial_w = torch.full((256,), 1e-4, dtype=torch.float32)
+    spatial_w[128:160] = 1.0  # focus on tabletop rows 8-9
+    spatial_w = spatial_w / spatial_w.sum()
+
+    lh.save_head(tmp_path / "legacy_linear.pt", saved_head, {"rank": 4})
+    spatial_ckpt = tmp_path / "anova_spatial.pt"
+    save_spatial_channel_head(spatial_ckpt, spatial_w, saved_head, {"regime": "fantope", "gamma": 1.5})
+
+    heads, weights_map, default_head = load_spatial_heads_directory(tmp_path, feature_dim=16)
+    assert "legacy_linear" in heads and weights_map["legacy_linear"] is None
+    assert "anova_spatial" in heads and weights_map["anova_spatial"] is not None
+    torch.testing.assert_close(weights_map["anova_spatial"], spatial_w, atol=1e-6, rtol=1e-6)
+    assert default_head in ("anova_spatial", "legacy_linear")
+
+    # render_patch_heatmap_overlay honors optional spatial_weights.
+    rgb = np.full((224, 224, 3), 180, dtype=np.uint8)
+    uniform_energy = np.ones((16, 16), dtype=np.float32)
+    weighted_overlay = render_patch_heatmap_overlay(rgb, uniform_energy, spatial_weights=spatial_w)
+    hot_band = weighted_overlay[112:140, :, :].astype(np.float32)
+    cold_band = weighted_overlay[0:28, :, :].astype(np.float32)
+    assert float(hot_band[..., 0].mean()) > float(cold_band[..., 0].mean()) + 50.0
+
+    # MetaWorldStudioSession loads SpatialChannelGoalHead and checkpoint paths cleanly.
+    mw_model = _MockPatchWorldModel(feature_dim=16, controls_per_chunk=2, step_action_dim=4)
+    mw_session = MetaWorldStudioSession(
+        mw_model,
+        {
+            "identity": lh.identity_head(16),
+            "anova_module": SpatialChannelGoalHead(saved_head, spatial_w),
+        },
+        warmup_steps=5,
+        goal_steps=5,
+        controls_per_chunk=2,
+        cem_samples=6,
+        cem_elites=2,
+        cem_iterations=2,
+        batch_size=6,
+        default_head="anova_module",
+    )
+    try:
+        reg_name = mw_session.register_head_checkpoint(spatial_ckpt)
+        assert reg_name == "anova_spatial"
+        assert mw_session.spatial_weights["anova_spatial"] is not None
+
+        inspected = mw_session.inspect_metaworld_task(seed=1000, head_name="anova_spatial")
+        assert inspected["effective_patches"] < 40.0
+        assert _decode_data_uri(inspected["learned_head"]["overlays"]["task_shift"]).size == (224, 224)
+
+        duel = mw_session.run_duel(seed=60000, head_name="anova_spatial", horizon=2, replans=1)
+        assert duel["effective_patches"] < 40.0
+        assert duel["trust_mpc"]["summary"]["unrolls"] == duel["baseline"]["summary"]["unrolls"]
+    finally:
+        mw_session.close()
 

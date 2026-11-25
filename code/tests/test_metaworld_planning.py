@@ -403,3 +403,184 @@ def test_mujoco_render_puck_sensitivity_pairs():
         assert not np.array_equal(pairs["visual"][1], pairs["reference_visual"])
     finally:
         env.close()
+
+
+class _PatchSelectiveMetaWorldToyModel:
+    """Toy model where patch 0 tracks action[0] and patches 1..3 track a distractor target."""
+
+    def __init__(self, puck_target: torch.Tensor, arm_distractor: torch.Tensor):
+        self.device = torch.device("cpu")
+        self.puck_target = puck_target.float()
+        self.arm_distractor = arm_distractor.float()
+        self.unroll_count = 0
+        self.recorded_action_batches: list[np.ndarray] = []
+
+    def encode(self, obs: dict) -> torch.Tensor:
+        return torch.zeros(1, 1, 4, 8)
+
+    def unroll(self, encoded_state: torch.Tensor, actions: torch.Tensor) -> dict[str, torch.Tensor]:
+        horizon, batch_size, action_dim = actions.shape
+        self.unroll_count += int(batch_size)
+        self.recorded_action_batches.append(actions.permute(1, 0, 2).detach().cpu().numpy().copy())
+        out = torch.zeros(horizon + 1, batch_size, 4, 8)
+        for step in range(horizon):
+            out[step + 1, :, 0, :action_dim] = actions[step] - self.puck_target[None, :]
+            out[step + 1, :, 1:, :action_dim] = (actions[step] - self.arm_distractor[None, :])[:, None, :]
+        return {"visual": out}
+
+
+def test_metaworld_trust_mpc_spatial_weights_and_prior_centered_shift():
+    lower, upper, hold = mwp.metaworld_action_bounds(METAWORLD_ACTION_MEAN, METAWORLD_ACTION_STD, 1)
+    puck_target = torch.tensor([0.8, 0.6, -0.5, 0.4], dtype=torch.float32)
+    arm_distractor = torch.tensor([-0.9, -0.8, 0.7, -0.6], dtype=torch.float32)
+    goal = torch.zeros(4, 8)
+    head = torch.eye(8) / np.sqrt(8.0)
+
+    horizon = 4
+    normals = np.random.default_rng(31).standard_normal((2, 16, horizon, 4)).astype(np.float32)
+
+    # Uniform spatial weights match spatial_weights=None identically (terminal and dense).
+    uniform_w = torch.full((4,), 0.25)
+    for sw in (None, (0.1, 0.2, 0.3, 0.4)):
+        chunk_none, _, info_none = mwp.metaworld_trust_mpc_plan(
+            _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor),
+            _dummy_obs(),
+            goal,
+            head,
+            normals,
+            lower,
+            upper,
+            hold,
+            num_elites=4,
+            batch_size=8,
+            step_weights=sw,
+            spatial_weights=None,
+        )
+        chunk_unif, _, info_unif = mwp.metaworld_trust_mpc_plan(
+            _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor),
+            _dummy_obs(),
+            goal,
+            head,
+            normals,
+            lower,
+            upper,
+            hold,
+            num_elites=4,
+            batch_size=8,
+            step_weights=sw,
+            spatial_weights=uniform_w,
+        )
+        np.testing.assert_allclose(chunk_unif, chunk_none, atol=1e-6)
+        np.testing.assert_allclose(info_unif["selected_cost"], info_none["selected_cost"], atol=1e-6)
+
+    # Concentrating spatial weights on patch 0 steers the plan toward puck_target
+    # instead of the 3-patch arm_distractor.
+    puck_w = torch.tensor([0.97, 0.01, 0.01, 0.01], dtype=torch.float32)
+    chunk_uniform, _, _ = mwp.metaworld_trust_mpc_plan(
+        _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor),
+        _dummy_obs(),
+        goal,
+        head,
+        normals,
+        lower,
+        upper,
+        hold,
+        num_elites=4,
+        batch_size=16,
+        stay_margin=0.0,
+        spatial_weights=None,
+    )
+    chunk_puck, _, _ = mwp.metaworld_trust_mpc_plan(
+        _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor),
+        _dummy_obs(),
+        goal,
+        head,
+        normals,
+        lower,
+        upper,
+        hold,
+        num_elites=4,
+        batch_size=16,
+        stay_margin=0.0,
+        spatial_weights=puck_w,
+    )
+    puck_np = puck_target.numpy()
+    assert float(np.linalg.norm(chunk_puck - puck_np)) < float(np.linalg.norm(chunk_uniform - puck_np))
+
+    # Verify sample_around_prior=True and step_chunks=3 warm-start shifting.
+    previous_plan = np.array(
+        [
+            [0.10, 0.10, 0.10, 0.10],
+            [0.20, 0.20, 0.20, 0.20],
+            [0.30, 0.30, 0.30, 0.30],
+            [0.45, -0.35, 0.25, -0.15],
+        ],
+        dtype=np.float32,
+    )
+    recording_model = _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor)
+    _, plan_prior, info_prior = mwp.metaworld_trust_mpc_plan(
+        recording_model,
+        _dummy_obs(),
+        goal,
+        head,
+        normals,
+        lower,
+        upper,
+        hold,
+        previous_plan=previous_plan,
+        num_elites=4,
+        batch_size=16,
+        stay_margin=0.0,
+        spatial_weights=puck_w,
+        sample_around_prior=True,
+        step_chunks=3,
+    )
+    assert info_prior["unrolls"] == 32 and recording_model.unroll_count == 32
+    assert np.all(plan_prior >= lower[None, :]) and np.all(plan_prior <= upper[None, :])
+
+    # First batch is all 16 iter0 candidates.
+    iter0_batch = recording_model.recorded_action_batches[0]
+    expected_hold_seq = np.tile(hold[None, :], (horizon, 1))
+    expected_shifted = np.vstack([previous_plan[3:], np.tile(hold[None, :], (3, 1))])
+    expected_prior_samples = np.clip(normals[0, 2:], lower[None, None, :], upper[None, None, :])
+
+    np.testing.assert_allclose(iter0_batch[0], expected_hold_seq, atol=1e-6)
+    np.testing.assert_allclose(iter0_batch[1], expected_shifted, atol=1e-6)
+    np.testing.assert_allclose(iter0_batch[2:], expected_prior_samples, atol=1e-6)
+
+    # Confirm default sample_around_prior=False still centers around hold_sequence.
+    hold_model = _PatchSelectiveMetaWorldToyModel(puck_target, arm_distractor)
+    mwp.metaworld_trust_mpc_plan(
+        hold_model,
+        _dummy_obs(),
+        goal,
+        head,
+        normals,
+        lower,
+        upper,
+        hold,
+        previous_plan=previous_plan,
+        num_elites=4,
+        batch_size=16,
+        sample_around_prior=False,
+        step_chunks=3,
+    )
+    expected_hold_samples = np.clip(
+        expected_hold_seq[None] + normals[0, 2:], lower[None, None, :], upper[None, None, :]
+    )
+    np.testing.assert_allclose(hold_model.recorded_action_batches[0][2:], expected_hold_samples, atol=1e-6)
+
+    # step_chunks validation.
+    with pytest.raises(ValueError):
+        mwp.metaworld_trust_mpc_plan(
+            hold_model,
+            _dummy_obs(),
+            goal,
+            head,
+            normals,
+            lower,
+            upper,
+            hold,
+            num_elites=4,
+            step_chunks=0,
+        )

@@ -27,6 +27,7 @@ from jepa_planning.calibrated_objectives import (
     dense_horizon_head_distance,
     projected_multi_goal_distance,
 )
+from jepa_planning.spatial_channel_head import spatial_patch_scale
 
 
 def metaworld_action_bounds(
@@ -203,11 +204,13 @@ def rollout_metaworld_costs(
     head: torch.Tensor,
     batch_size: int = 32,
     step_weights: Sequence[float] | None = None,
+    spatial_weights: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Predict rollouts for ``[N, H, A]`` actions and score under head ``L``.
 
-    Supports single goals ``[P, D]``, multi-goal banks ``[K, P, D]``, and
-    optional nonnegative horizon ``step_weights`` of length ``H``.
+    Supports single goals ``[P, D]``, multi-goal banks ``[K, P, D]``, optional
+    nonnegative horizon ``step_weights`` of length ``H``, and optional simplex
+    ``spatial_weights`` of length ``P``.
     """
     if candidate_actions.ndim != 3 or min(candidate_actions.shape) == 0:
         raise ValueError("candidate_actions must be non-empty with shape [N, H, A]")
@@ -220,6 +223,19 @@ def rollout_metaworld_costs(
     feature_dim = goal.shape[-1]
     horizon = candidate_actions.shape[1]
 
+    patch_scale: torch.Tensor | None = None
+    if spatial_weights is not None:
+        if goal.ndim not in (2, 3):
+            raise ValueError("goal_features must have shape [P, D] or [K, P, D]")
+        num_patches = goal.shape[-2]
+        patch_scale = spatial_patch_scale(
+            spatial_weights, num_patches, device=device, dtype=torch.float32
+        )
+        if goal.ndim == 2:
+            goal = goal * patch_scale[:, None]
+        else:
+            goal = goal * patch_scale[None, :, None]
+
     all_costs = []
     for start in range(0, len(candidate_actions), batch_size):
         chunk_batch = np.ascontiguousarray(candidate_actions[start : start + batch_size], dtype=np.float32)
@@ -227,10 +243,14 @@ def rollout_metaworld_costs(
         predicted_visual = model.unroll(encoded_state, action_tensor)["visual"]
         if step_weights is None:
             terminal_features = predicted_visual[-1].reshape(len(chunk_batch), -1, feature_dim).float()
+            if patch_scale is not None:
+                terminal_features = terminal_features * patch_scale[None, :, None]
             cost = projected_multi_goal_distance(terminal_features, goal, head_device, exact_mean=False)
         else:
             rollout_steps = predicted_visual[-horizon:]
             rollout_features = rollout_steps.reshape(horizon, len(chunk_batch), -1, feature_dim).float()
+            if patch_scale is not None:
+                rollout_features = rollout_features * patch_scale[None, None, :, None]
             cost = dense_horizon_head_distance(
                 rollout_features, goal, head_device, step_weights=step_weights
             )
@@ -254,8 +274,9 @@ def metaworld_cem_plan(
     step_weights: Sequence[float] | None = None,
     init_mean: np.ndarray | None = None,
     init_std: float = 1.0,
+    spatial_weights: torch.Tensor | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Box-constrained CEM planner supporting multi-goal and dense-horizon scoring."""
+    """Box-constrained CEM planner supporting multi-goal, dense-horizon, and spatial-weighted scoring."""
     normals = np.asarray(normals, dtype=np.float32)
     if normals.ndim != 4 or min(normals.shape) == 0:
         raise ValueError("normals must have shape [iterations, samples, horizon, action_dim]")
@@ -297,6 +318,7 @@ def metaworld_cem_plan(
             head,
             batch_size=batch_size,
             step_weights=step_weights,
+            spatial_weights=spatial_weights,
         )
         total_unrolls += len(actions)
         elites = np.argsort(costs)[:num_elites]
@@ -333,15 +355,20 @@ def metaworld_trust_mpc_plan(
     step_weights: Sequence[float] | None = None,
     dual_certify: bool = True,
     init_std: float = 1.0,
+    spatial_weights: torch.Tensor | None = None,
+    sample_around_prior: bool = False,
+    step_chunks: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Box-constrained Jensen-certified Trust-MPC with exact ``2 * N`` rollout parity.
 
-    Iteration 0 evaluates ``N`` candidates centered at ``hold_sequence`` (true
-    zero displacement), anchoring slot 0 at ``hold_sequence`` and slot 1 at the
-    shifted warm-start plan when available. Iteration 1 evaluates ``N - 2``
-    samples when ``dual_certify=True`` (or ``N - 1`` when ``dual_certify=False``)
-    and spends the remaining rollout(s) to certify ``elite_mean`` (and the
-    dominant half-space ``mode_mean`` when ``dual_certify=True``).
+    Iteration 0 evaluates ``N`` candidates centered at ``hold_sequence`` (or at
+    normalized ``0`` clipped to ``[lower, upper]`` when
+    ``sample_around_prior=True``), anchoring slot 0 at ``hold_sequence`` and
+    slot 1 at the ``step_chunks``-shifted warm-start plan when available.
+    Iteration 1 evaluates ``N - 2`` samples when ``dual_certify=True`` (or
+    ``N - 1`` when ``dual_certify=False``) and spends the remaining rollout(s)
+    to certify ``elite_mean`` (and the dominant half-space ``mode_mean`` when
+    ``dual_certify=True``).
     """
     normals = np.asarray(normals, dtype=np.float32)
     if normals.ndim != 4 or normals.shape[0] < 2 or min(normals.shape[1:]) == 0:
@@ -355,6 +382,10 @@ def metaworld_trust_mpc_plan(
     hold_clipped = np.clip(hold_arr, lo, hi).astype(np.float32)
     hold_sequence = np.tile(hold_clipped[None, :], (horizon, 1)).astype(np.float32)
 
+    if isinstance(step_chunks, bool) or not isinstance(step_chunks, (int, np.integer)) or int(step_chunks) < 1:
+        raise ValueError("step_chunks must be a positive integer")
+    shift_steps = int(step_chunks)
+
     cert_count = 2 if dual_certify else 1
     iter1_count = samples_per_iter - cert_count
     if iter1_count < 1:
@@ -366,9 +397,18 @@ def metaworld_trust_mpc_plan(
 
     encoded_state = _encode_observation(model, observation)
 
+    if sample_around_prior:
+        iter0_center = np.clip(
+            np.zeros((horizon, action_dim), dtype=np.float32),
+            lo[None, :],
+            hi[None, :],
+        ).astype(np.float32)
+    else:
+        iter0_center = hold_sequence
+
     std0 = np.full((horizon, action_dim), float(init_std), dtype=np.float32)
     iter0_actions = np.clip(
-        hold_sequence[None] + std0[None] * normals[0],
+        iter0_center[None] + std0[None] * normals[0],
         lo[None, None, :],
         hi[None, None, :],
     ).astype(np.float32)
@@ -377,7 +417,9 @@ def metaworld_trust_mpc_plan(
         prev = np.asarray(previous_plan, dtype=np.float32)
         if prev.shape != (horizon, action_dim):
             raise ValueError(f"previous_plan must have shape ({horizon}, {action_dim})")
-        shifted_plan = np.vstack([prev[1:], hold_clipped[None, :]]).astype(np.float32)
+        pad_count = min(shift_steps, horizon)
+        tail = np.tile(hold_clipped[None, :], (pad_count, 1))
+        shifted_plan = np.vstack([prev[shift_steps:], tail])[:horizon].astype(np.float32)
         iter0_actions[1] = np.clip(shifted_plan, lo[None, :], hi[None, :])
 
     iter0_costs = rollout_metaworld_costs(
@@ -388,6 +430,7 @@ def metaworld_trust_mpc_plan(
         head,
         batch_size=batch_size,
         step_weights=step_weights,
+        spatial_weights=spatial_weights,
     )
     hold_cost = float(iter0_costs[0])
 
@@ -409,6 +452,7 @@ def metaworld_trust_mpc_plan(
         head,
         batch_size=batch_size,
         step_weights=step_weights,
+        spatial_weights=spatial_weights,
     )
 
     final_elites = np.argsort(iter1_costs)[:num_elites]
@@ -442,6 +486,7 @@ def metaworld_trust_mpc_plan(
             head,
             batch_size=batch_size,
             step_weights=step_weights,
+            spatial_weights=spatial_weights,
         )
         mean_cost = float(cert_costs[0])
         mode_cost = float(cert_costs[1])
@@ -455,6 +500,7 @@ def metaworld_trust_mpc_plan(
                 head,
                 batch_size=batch_size,
                 step_weights=step_weights,
+                spatial_weights=spatial_weights,
             )[0]
         )
         mode_cost = float("nan")

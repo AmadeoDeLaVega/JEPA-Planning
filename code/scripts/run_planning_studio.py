@@ -34,6 +34,7 @@ from jepa_planning.studio import (  # noqa: E402
     PushTStudioSession,
     create_studio_server,
     load_heads_directory,
+    load_spatial_heads_directory,
 )
 
 
@@ -125,11 +126,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.export_metaworld_gif is not None and args.export_demo_gif is None:
         print(f"Loading Meta-World DINO-WM on {args.device}...", flush=True)
         mw_model = load_world_model("metaworld", args.device).requires_grad_(False).eval()
-        mw_heads, default_mw_head = load_heads_directory(args.metaworld_heads_dir)
+        mw_heads, mw_spatial_weights, default_mw_head = load_spatial_heads_directory(
+            args.metaworld_heads_dir
+        )
         print(f"Loaded {len(mw_heads)} Meta-World head(s); default: {default_mw_head}", flush=True)
         mw_session = MetaWorldStudioSession(
             mw_model,
             mw_heads,
+            spatial_weights=mw_spatial_weights,
             cem_samples=int(args.mw_samples),
             cem_elites=int(args.mw_elites),
             batch_size=int(args.mw_batch_size),
@@ -189,10 +193,13 @@ def main(argv: list[str] | None = None) -> None:
     if need_metaworld:
         print(f"Loading Meta-World DINO-WM on {args.device}...", flush=True)
         mw_model = load_world_model("metaworld", args.device).requires_grad_(False).eval()
-        mw_heads, default_mw_head = load_heads_directory(args.metaworld_heads_dir)
+        mw_heads, mw_spatial_weights, default_mw_head = load_spatial_heads_directory(
+            args.metaworld_heads_dir
+        )
         mw_session = MetaWorldStudioSession(
             mw_model,
             mw_heads,
+            spatial_weights=mw_spatial_weights,
             cem_samples=int(args.mw_samples),
             cem_elites=int(args.mw_elites),
             batch_size=int(args.mw_batch_size),

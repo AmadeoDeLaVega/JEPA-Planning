@@ -31,6 +31,12 @@ from jepa_planning import pusht_head_planning as hp
 from jepa_planning import trust_mpc as tm
 from jepa_planning.calibrated_objectives import patch_energy_map
 from jepa_planning.pusht_multi_goal import cem_standard_normals, state_from
+from jepa_planning.spatial_channel_head import (
+    SpatialChannelGoalHead,
+    effective_patches,
+    load_spatial_channel_head,
+    spatial_patch_scale,
+)
 from jepa_planning.waypoint_mpc import (
     WaypointTracker,
     compose_waypoint_gif_bytes,
@@ -179,6 +185,7 @@ def render_patch_heatmap_overlay(
     energy_grid: np.ndarray,
     alpha: float = 0.58,
     vmax: float | None = None,
+    spatial_weights: torch.Tensor | np.ndarray | None = None,
 ) -> np.ndarray:
     """Overlay a patch-energy grid on an RGB frame with crisp patch boundaries.
 
@@ -188,6 +195,9 @@ def render_patch_heatmap_overlay(
             ``[16, 16]``) or flat square ``[P]``.
         alpha: Maximum blending strength in ``[0, 1]``.
         vmax: Optional upper scale for normalization; defaults to ``max(energy_grid)``.
+        spatial_weights: Optional 1D simplex patch weights of length ``P`` (or
+            ``[G, G]``) multiplying per-patch energy by ``P * w_i`` before
+            normalization.
 
     Returns:
         Blended ``[H, W, 3]`` uint8 RGB array.
@@ -209,6 +219,22 @@ def render_patch_heatmap_overlay(
         raise ValueError("energy_grid must contain only finite values")
 
     clipped_grid = np.maximum(grid, 0.0)
+    if spatial_weights is not None:
+        raw_w = (
+            spatial_weights.detach().cpu().numpy()
+            if isinstance(spatial_weights, torch.Tensor)
+            else np.asarray(spatial_weights)
+        )
+        w_flat = np.asarray(raw_w, dtype=np.float32).reshape(-1)
+        if w_flat.size != clipped_grid.size or not np.all(np.isfinite(w_flat)):
+            raise ValueError(
+                f"spatial_weights must contain {clipped_grid.size} finite values, got {w_flat.size}"
+            )
+        if np.any(w_flat < 0.0) or float(w_flat.sum()) <= 0.0:
+            raise ValueError("spatial_weights must be nonnegative with positive sum")
+        w_norm = (w_flat / float(w_flat.sum())).reshape(clipped_grid.shape)
+        clipped_grid = clipped_grid * (float(clipped_grid.size) * w_norm)
+
     if vmax is not None:
         if isinstance(vmax, bool) or not np.isfinite(vmax) or float(vmax) <= 0.0:
             raise ValueError("vmax must be a positive finite number when provided")
@@ -391,12 +417,13 @@ def standard_cem_plan(
     }
 
 
-def load_heads_directory(
+def load_spatial_heads_directory(
     heads_dir: Path | None,
     feature_dim: int = lh.FEATURE_DIM,
-) -> tuple[dict[str, torch.Tensor], str]:
-    """Load saved ``.pt`` goal heads from ``heads_dir`` alongside plain-MSE identity."""
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None], str]:
+    """Load saved ``.pt`` linear and spatial-channel goal heads alongside identity."""
     heads: dict[str, torch.Tensor] = {"identity": lh.identity_head(feature_dim)}
+    spatial_weights: dict[str, torch.Tensor | None] = {"identity": None}
     if heads_dir is not None:
         directory = Path(heads_dir)
         search_dirs = [directory]
@@ -406,8 +433,9 @@ def load_heads_directory(
             if not folder.is_dir():
                 continue
             for path in sorted(folder.glob("*.pt")):
-                matrix, _ = lh.load_head(path)
+                weights, matrix, _ = load_spatial_channel_head(path)
                 heads[path.stem] = matrix.float()
+                spatial_weights[path.stem] = weights.float() if weights is not None else None
 
     preferred = "iso005_tau03_2k_B1024_M256_K4_r0"
     if preferred in heads:
@@ -416,21 +444,34 @@ def load_heads_directory(
         iso_heads = [name for name in heads if name != "identity" and "iso" in name]
         non_identity = [name for name in heads if name != "identity"]
         default_head = iso_heads[0] if iso_heads else (non_identity[0] if non_identity else "identity")
+    return heads, spatial_weights, default_head
+
+
+def load_heads_directory(
+    heads_dir: Path | None,
+    feature_dim: int = lh.FEATURE_DIM,
+) -> tuple[dict[str, torch.Tensor], str]:
+    """Load saved ``.pt`` goal heads from ``heads_dir`` alongside plain-MSE identity."""
+    heads, _, default_head = load_spatial_heads_directory(heads_dir, feature_dim=feature_dim)
     return heads, default_head
 
 
-def _head_catalog_metadata(heads: dict[str, torch.Tensor]) -> list[dict[str, object]]:
+def _head_catalog_metadata(
+    heads: dict[str, torch.Tensor],
+    spatial_weights: dict[str, torch.Tensor | None] | None = None,
+) -> list[dict[str, object]]:
     """Return serializable rank and shape summaries for every loaded head."""
     rows: list[dict[str, object]] = []
     for name, matrix in heads.items():
-        rows.append(
-            {
-                "name": name,
-                "rank": int(matrix.shape[0]),
-                "feature_dim": int(matrix.shape[1]),
-                "effective_rank": round(tm.effective_rank(matrix), 2),
-            }
-        )
+        row: dict[str, object] = {
+            "name": name,
+            "rank": int(matrix.shape[0]),
+            "feature_dim": int(matrix.shape[1]),
+            "effective_rank": round(tm.effective_rank(matrix), 2),
+        }
+        if spatial_weights is not None and spatial_weights.get(name) is not None:
+            row["effective_patches"] = round(effective_patches(spatial_weights[name]), 2)
+        rows.append(row)
     return rows
 
 
@@ -1245,9 +1286,10 @@ class MetaWorldStudioSession:
     def __init__(
         self,
         model,
-        heads: dict[str, torch.Tensor],
+        heads: dict[str, torch.Tensor | SpatialChannelGoalHead | Path | str],
         env=None,
         *,
+        spatial_weights: dict[str, torch.Tensor | None] | None = None,
         warmup_steps: int = 15,
         goal_steps: int = 25,
         controls_per_chunk: int = 5,
@@ -1262,11 +1304,31 @@ class MetaWorldStudioSession:
         if not heads:
             raise ValueError("heads dictionary must contain at least one head")
         self.model = model
-        self.heads = {name: mat.detach().cpu().float() for name, mat in heads.items()}
+        self.heads: dict[str, torch.Tensor] = {}
+        self.spatial_weights: dict[str, torch.Tensor | None] = {}
+        for name, entry in heads.items():
+            if isinstance(entry, SpatialChannelGoalHead):
+                self.heads[name] = entry.head.detach().cpu().float()
+                self.spatial_weights[name] = entry.spatial_weights.detach().cpu().float()
+            elif isinstance(entry, (Path, str)):
+                w, mat, _ = load_spatial_channel_head(Path(entry))
+                self.heads[name] = mat.detach().cpu().float()
+                self.spatial_weights[name] = w.detach().cpu().float() if w is not None else None
+            else:
+                self.heads[name] = entry.detach().cpu().float()
+                self.spatial_weights[name] = None
+        if spatial_weights is not None:
+            for name, weights in spatial_weights.items():
+                if name in self.heads and weights is not None:
+                    self.spatial_weights[name] = weights.detach().cpu().float()
+
         first_head = next(iter(self.heads.values()))
         self.feature_dim = int(first_head.shape[1])
         if "identity" not in self.heads:
             self.heads["identity"] = lh.identity_head(self.feature_dim)
+            self.spatial_weights["identity"] = None
+        else:
+            self.spatial_weights.setdefault("identity", None)
 
         if default_head is not None and default_head in self.heads:
             self.default_head = default_head
@@ -1317,11 +1379,26 @@ class MetaWorldStudioSession:
         if self._owns_env and self.env is not None:
             self.env.close()
 
+    def register_head_checkpoint(self, path: Path, name: str | None = None) -> str:
+        """Load a standard linear or spatial-channel head checkpoint into this session."""
+        weights, matrix, _ = load_spatial_channel_head(Path(path))
+        head_name = name if name is not None else Path(path).stem
+        self.heads[head_name] = matrix.detach().cpu().float()
+        self.spatial_weights[head_name] = weights.detach().cpu().float() if weights is not None else None
+        return head_name
+
     def _resolve_head(self, head_name: str | None) -> tuple[str, torch.Tensor]:
         name = self.default_head if not head_name else str(head_name)
         if name not in self.heads:
             raise KeyError(f"Unknown Meta-World head '{name}'. Available: {sorted(self.heads)}")
         return name, self.heads[name]
+
+    def _resolve_head_with_weights(
+        self,
+        head_name: str | None,
+    ) -> tuple[str, torch.Tensor, torch.Tensor | None]:
+        name, matrix = self._resolve_head(head_name)
+        return name, matrix, self.spatial_weights.get(name)
 
     def inspect_metaworld_task(
         self,
@@ -1340,7 +1417,7 @@ class MetaWorldStudioSession:
         if not np.isfinite(shift_cm) or float(shift_cm) <= 0.0:
             raise ValueError("shift_cm must be positive and finite")
 
-        resolved_name, head_matrix = self._resolve_head(head_name)
+        resolved_name, head_matrix, spatial_w = self._resolve_head_with_weights(head_name)
         shift_m = float(shift_cm) / 100.0
         angle_rad = math.radians(float(hand_offset_angle_deg))
 
@@ -1398,8 +1475,20 @@ class MetaWorldStudioSession:
 
         mse_nuis_grid = patch_energy_map(f_goal, f_nuis, head=None).numpy()
         mse_task_grid = patch_energy_map(f_goal, f_shift, head=None).numpy()
-        head_nuis_grid = patch_energy_map(f_goal, f_nuis, head=head_matrix).numpy()
-        head_task_grid = patch_energy_map(f_goal, f_shift, head=head_matrix).numpy()
+        head_nuis_raw = patch_energy_map(f_goal, f_nuis, head=head_matrix).numpy()
+        head_task_raw = patch_energy_map(f_goal, f_shift, head=head_matrix).numpy()
+        if spatial_w is not None:
+            patch_scale = (
+                spatial_patch_scale(spatial_w, f_goal.shape[-2], device=f_goal.device, dtype=f_goal.dtype)
+                .numpy()
+                .reshape(head_nuis_raw.shape)
+            )
+            weight_factor = patch_scale * patch_scale
+            head_nuis_grid = head_nuis_raw * weight_factor
+            head_task_grid = head_task_raw * weight_factor
+        else:
+            head_nuis_grid = head_nuis_raw
+            head_task_grid = head_task_raw
 
         mse_nuis_mean = float(mse_nuis_grid.mean())
         mse_task_mean = float(mse_task_grid.mean())
@@ -1418,6 +1507,11 @@ class MetaWorldStudioSession:
             "shift_cm": float(shift_cm),
             "head_name": resolved_name,
             "effective_rank": float(tm.effective_rank(head_matrix)),
+            "effective_patches": (
+                float(effective_patches(spatial_w))
+                if spatial_w is not None
+                else float(head_nuis_raw.size)
+            ),
             "physical": {
                 "hand_displacement_cm": float(100.0 * np.linalg.norm(nuis_hand[:2] - ref_hand[:2])),
                 "puck_shift_cm": float(shift_cm),
@@ -1444,16 +1538,25 @@ class MetaWorldStudioSession:
             "learned_head": {
                 "head_name": resolved_name,
                 "effective_rank": float(tm.effective_rank(head_matrix)),
+                "effective_patches": (
+                    float(effective_patches(spatial_w))
+                    if spatial_w is not None
+                    else float(head_nuis_raw.size)
+                ),
                 "nuisance_energy": head_nuis_mean,
                 "task_energy": head_task_mean,
                 "task_to_nuisance_ratio": head_ratio,
                 "ratio_gain_vs_mse": float(head_ratio / max(mse_ratio, 1e-12)),
                 "overlays": {
                     "nuisance": encode_png_base64(
-                        render_patch_heatmap_overlay(nuis_rgb, head_nuis_grid, vmax=head_vmax)
+                        render_patch_heatmap_overlay(
+                            nuis_rgb, head_nuis_raw, vmax=head_vmax, spatial_weights=spatial_w
+                        )
                     ),
                     "task_shift": encode_png_base64(
-                        render_patch_heatmap_overlay(shift_rgb, head_task_grid, vmax=head_vmax)
+                        render_patch_heatmap_overlay(
+                            shift_rgb, head_task_raw, vmax=head_vmax, spatial_weights=spatial_w
+                        )
                     ),
                 },
             },
@@ -1479,7 +1582,7 @@ class MetaWorldStudioSession:
         if isinstance(replans, bool) or not isinstance(replans, int) or not 1 <= replans <= 20:
             raise ValueError("replans must be an integer between 1 and 20")
 
-        resolved_name, head_matrix = self._resolve_head(head_name)
+        resolved_name, head_matrix, spatial_w = self._resolve_head_with_weights(head_name)
         lower, upper, hold_chunk = mwp.metaworld_action_bounds(
             self.action_mean, self.action_std, self.controls_per_chunk
         )
@@ -1550,6 +1653,7 @@ class MetaWorldStudioSession:
                 lower=lower,
                 upper=upper,
                 hold_chunk=hold_chunk,
+                spatial_weights=None,
             )
             trust_result, trust_rgb = self._run_single_episode_unlocked(
                 start_snap=start_snap,
@@ -1561,6 +1665,7 @@ class MetaWorldStudioSession:
                 lower=lower,
                 upper=upper,
                 hold_chunk=hold_chunk,
+                spatial_weights=spatial_w,
             )
             self._latest_duel_frames = (baseline_rgb, trust_rgb, goal_rgb)
 
@@ -1569,6 +1674,9 @@ class MetaWorldStudioSession:
             "hand_offset_angle_deg": float(hand_offset_angle_deg),
             "head_name": resolved_name,
             "effective_rank": float(tm.effective_rank(head_matrix)),
+            "effective_patches": (
+                float(effective_patches(spatial_w)) if spatial_w is not None else None
+            ),
             "horizon": horizon,
             "replans": replans,
             "controls_per_chunk": self.controls_per_chunk,
@@ -1592,6 +1700,7 @@ class MetaWorldStudioSession:
         lower: np.ndarray,
         upper: np.ndarray,
         hold_chunk: np.ndarray,
+        spatial_weights: torch.Tensor | None = None,
     ) -> tuple[dict[str, object], list[np.ndarray]]:
         from jepa_planning import metaworld_push as mp
 
@@ -1630,6 +1739,7 @@ class MetaWorldStudioSession:
                     upper,
                     num_elites=self.cem_elites,
                     batch_size=self.batch_size,
+                    spatial_weights=spatial_weights,
                 )
                 extra_diag: dict[str, object] = {
                     "best_cost": float(plan_info["best_cost"]),
@@ -1651,6 +1761,7 @@ class MetaWorldStudioSession:
                     batch_size=self.batch_size,
                     stay_margin=self.stay_margin,
                     dual_certify=self.dual_certify,
+                    spatial_weights=spatial_weights,
                 )
                 raw_mode_cost = float(plan_info["mode_mean_cost"])
                 extra_diag = {
@@ -1774,7 +1885,11 @@ class PlanningStudioBackend:
             },
             "metaworld": {
                 "enabled": self.metaworld is not None,
-                "heads": _head_catalog_metadata(self.metaworld.heads) if self.metaworld is not None else [],
+                "heads": (
+                    _head_catalog_metadata(self.metaworld.heads, self.metaworld.spatial_weights)
+                    if self.metaworld is not None
+                    else []
+                ),
                 "default_head": self.metaworld.default_head if self.metaworld is not None else None,
                 "has_duel_gif": self.metaworld.has_latest_duel_gif() if self.metaworld is not None else False,
                 "config": (
