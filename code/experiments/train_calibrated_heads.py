@@ -2,18 +2,22 @@
 """Unified CLI head trainer and spectral auditor for calibrated linear goal heads.
 
 Fits low-rank linear goal heads L in R^{r x D} (||L||_F = 1) on cached DINO-WM
-goal-group features under three training regimes:
+goal-group features under five training regimes:
 
-  - unregularized : standard trace-normalized InfoNCE (linear_head.fit_head)
-  - isotropy      : InfoNCE + log-det row-isotropy regularization
-  - fantope       : InfoNCE + periodic exact k-Fantope spectral projection
+  - unregularized  : standard trace-normalized InfoNCE (linear_head.fit_head)
+  - isotropy       : InfoNCE + log-det row-isotropy regularization
+  - fantope        : InfoNCE + periodic exact k-Fantope spectral projection
+  - anova_fantope  : closed-form ANOVA spatial weights w + k-Fantope channel head L
+  - anova_isotropy : closed-form ANOVA spatial weights w + log-det isotropy channel head L
 
 Works identically on PushT and Meta-World goal-group directories containing
 ``images.npz`` ("group"), ``features.pt`` ("groups", optional "sensitivity"),
 and optional ``sensitivity.npz`` ("group", "kind", "amount").
 
-Saves every fitted head via ``linear_head.save_head`` under ``<output>/heads/*.pt``
-and writes ``<output>/spectral_audit.csv`` and ``<output>/spectral_audit.json``.
+Saves every fitted head under ``<output>/heads/*.pt`` (via ``linear_head.save_head``
+for uniform-patch heads and ``spatial_channel_head.save_spatial_channel_head`` for
+ANOVA spatial-channel heads) and writes ``<output>/spectral_audit.csv`` and
+``<output>/spectral_audit.json``.
 
 Usage (repository root):
   .venv/bin/python code/experiments/train_calibrated_heads.py \
@@ -40,9 +44,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from jepa_planning import linear_head as lh  # noqa: E402
+from jepa_planning import spatial_channel_head as sch  # noqa: E402
 from jepa_planning import trust_mpc as tm  # noqa: E402
 
-REGIMES = ("unregularized", "isotropy", "fantope")
+DEFAULT_REGIMES = ("unregularized", "isotropy", "fantope")
+ANOVA_REGIMES = ("anova_fantope", "anova_isotropy")
+REGIMES = DEFAULT_REGIMES + ANOVA_REGIMES
 
 
 def load_goal_groups(directory: Path, device: str, min_images: int = 0) -> dict:
@@ -112,11 +119,27 @@ def spectral_summary(head: torch.Tensor) -> dict[str, float]:
     }
 
 
-def evaluate_head(head: torch.Tensor, val_data: dict) -> dict[str, float]:
+def evaluate_head(
+    head: torch.Tensor,
+    val_data: dict,
+    *,
+    spatial_weights: torch.Tensor | None = None,
+) -> dict[str, float]:
     """Score validation retrieval metrics and optional object-shift sensitivity ratios."""
     val_features = val_data["features"]
     head_device = head.to(device=val_features.device, dtype=torch.float32)
-    metrics = lh.retrieval_metrics(val_features, val_data["groups"], head_device)
+    patch_scale: torch.Tensor | None = None
+    if spatial_weights is not None:
+        patch_scale = sch.spatial_patch_scale(
+            spatial_weights,
+            int(val_features.shape[1]),
+            device=val_features.device,
+            dtype=torch.float32,
+        )
+        scored_features = val_features.float() * patch_scale[None, :, None]
+    else:
+        scored_features = val_features
+    metrics = lh.retrieval_metrics(scored_features, val_data["groups"], head_device)
 
     sens = val_data.get("sensitivity")
     if sens is not None and len(sens["group"]) > 0:
@@ -131,8 +154,10 @@ def evaluate_head(head: torch.Tensor, val_data: dict) -> dict[str, float]:
                 dtype=torch.long,
                 device=val_features.device,
             )
-            reference = torch.index_select(val_features, 0, ref_indices)
+            reference = torch.index_select(scored_features, 0, ref_indices)
             perturbed = sens["features"][torch.from_numpy(usable).to(sens["features"].device)]
+            if patch_scale is not None:
+                perturbed = perturbed.float() * patch_scale[None, :, None]
             ratios = lh.sensitivity_ratios(reference, perturbed, head_device, metrics["within_median"])
 
             kinds = sens["kind"][usable]
@@ -154,6 +179,8 @@ def make_head_name(
     *,
     isotropy_weight: float = 0.015,
     fantope_k: float = 4.0,
+    anova_gamma: float = 1.5,
+    anova_floor: float = 0.25,
 ) -> str:
     """Deterministic stem for a fitted head checkpoint."""
     if regime == "isotropy":
@@ -162,6 +189,10 @@ def make_head_name(
         tag = f"fantope_k{fantope_k:g}"
     elif regime == "unregularized":
         tag = "unregularized"
+    elif regime == "anova_fantope":
+        tag = f"anova_fantope_k{fantope_k:g}_g{anova_gamma:g}_f{anova_floor:g}"
+    elif regime == "anova_isotropy":
+        tag = f"anova_isotropy_w{isotropy_weight:g}_g{anova_gamma:g}_f{anova_floor:g}"
     else:
         raise ValueError(f"unsupported regime: {regime}")
     return f"{tag}_r{rank}_B{budget}_K{hands}_s{resample}"
@@ -183,15 +214,18 @@ def train_and_audit_head(
     isotropy_weight: float = 0.015,
     fantope_k: float = 4.0,
     project_every: int = 5,
+    anova_gamma: float = 1.5,
+    anova_floor: float = 0.25,
     seed: int = 0,
-) -> tuple[torch.Tensor, dict, dict]:
-    """Fit one linear head under ``regime`` and return ``(head, config, audit_row)``."""
+) -> tuple[torch.Tensor, dict, dict, torch.Tensor | None]:
+    """Fit one goal head under ``regime`` and return ``(head, config, audit_row, spatial_weights)``."""
     if regime not in REGIMES:
         raise ValueError(f"regime must be one of {REGIMES}, got {regime!r}")
     if budget <= 0 or hands < 2 or budget % hands != 0:
         raise ValueError(f"budget ({budget}) must be a positive multiple of hands ({hands} >= 2)")
 
     train_features = train_data["features"]
+    num_patches = int(train_features.shape[1])
     feature_dim = int(train_features.shape[-1])
     if not 1 <= rank <= feature_dim:
         raise ValueError(f"rank must be between 1 and {feature_dim}, got {rank}")
@@ -207,6 +241,8 @@ def train_and_audit_head(
     if len(sampler.images) != budget:
         raise RuntimeError(f"expected {budget} sampled images, got {len(sampler.images)}")
 
+    spatial_weights: torch.Tensor | None = None
+    anova_meta: dict | None = None
     started = perf_counter()
     if regime == "unregularized":
         head, _ = lh.fit_head(
@@ -231,7 +267,7 @@ def train_and_audit_head(
             seed=run_seed,
             rank=rank,
         )
-    else:
+    elif regime == "fantope":
         head = tm.fit_fantope_head(
             train_features,
             sampler,
@@ -244,9 +280,34 @@ def train_and_audit_head(
             rank=rank,
             project_every=project_every,
         )
+    elif regime in ANOVA_REGIMES:
+        inner_regime = "fantope" if regime == "anova_fantope" else "isotropy"
+        spatial_weights, head, anova_meta = sch.fit_anova_spatial_head(
+            train_features,
+            train_data["groups"],
+            sampler,
+            gamma=anova_gamma,
+            uniform_floor=anova_floor,
+            regime=inner_regime,
+            k_fantope=fantope_k,
+            isotropy_weight=isotropy_weight,
+            steps=steps,
+            batch_size=batch_size,
+            tau=tau,
+            lr=lr,
+            seed=run_seed,
+            rank=rank,
+        )
+    else:
+        raise ValueError(f"unsupported regime: {regime}")
     elapsed = perf_counter() - started
 
     head = lh.normalized(head.detach().cpu().float())
+    eff_patches = (
+        float(sch.effective_patches(spatial_weights))
+        if spatial_weights is not None
+        else float(num_patches)
+    )
     head_name = make_head_name(
         regime,
         rank,
@@ -255,9 +316,15 @@ def train_and_audit_head(
         resample,
         isotropy_weight=isotropy_weight,
         fantope_k=fantope_k,
+        anova_gamma=anova_gamma,
+        anova_floor=anova_floor,
     )
     spec = spectral_summary(head)
-    val_metrics = evaluate_head(head, val_data)
+    val_metrics = evaluate_head(head, val_data, spatial_weights=spatial_weights)
+
+    uses_isotropy = regime in ("isotropy", "anova_isotropy")
+    uses_fantope = regime in ("fantope", "anova_fantope")
+    uses_anova = regime in ANOVA_REGIMES
 
     config = {
         "regime": regime,
@@ -273,11 +340,17 @@ def train_and_audit_head(
         "batch_size": int(batch_size),
         "tau": float(tau),
         "lr": float(lr),
-        "isotropy_weight": float(isotropy_weight) if regime == "isotropy" else 0.0,
-        "fantope_k": float(fantope_k) if regime == "fantope" else None,
+        "isotropy_weight": float(isotropy_weight) if uses_isotropy else 0.0,
+        "fantope_k": float(fantope_k) if uses_fantope else None,
         "project_every": int(project_every) if regime == "fantope" else None,
+        "anova_gamma": float(anova_gamma) if uses_anova else None,
+        "anova_floor": float(anova_floor) if uses_anova else None,
+        "effective_patches": eff_patches,
         "shuffled_labels": False,
     }
+    if anova_meta is not None:
+        config["tau_var"] = float(anova_meta["tau_var"])
+
     audit_row = {
         "head": head_name,
         "head_path": f"heads/{head_name}.pt",
@@ -291,13 +364,16 @@ def train_and_audit_head(
         "tau": float(tau),
         "lr": float(lr),
         "steps": int(steps),
-        "isotropy_weight": float(isotropy_weight) if regime == "isotropy" else "",
-        "fantope_k": float(fantope_k) if regime == "fantope" else "",
+        "isotropy_weight": float(isotropy_weight) if uses_isotropy else "",
+        "fantope_k": float(fantope_k) if uses_fantope else "",
+        "anova_gamma": float(anova_gamma) if uses_anova else "",
+        "anova_floor": float(anova_floor) if uses_anova else "",
+        "effective_patches": eff_patches,
         **spec,
         **val_metrics,
         "elapsed_seconds": float(elapsed),
     }
-    return head, config, audit_row
+    return head, config, audit_row, spatial_weights
 
 
 def write_audit_csv(path: Path, rows: list[dict]) -> None:
@@ -323,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--regimes",
         nargs="+",
         choices=REGIMES,
-        default=list(REGIMES),
+        default=list(DEFAULT_REGIMES),
         help="Spectral training regimes to fit",
     )
     parser.add_argument(
@@ -351,19 +427,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--isotropy-weight",
         type=float,
         default=0.015,
-        help="Log-det isotropy penalty weight for the isotropy regime",
+        help="Log-det isotropy penalty weight for isotropy and anova_isotropy regimes",
     )
     parser.add_argument(
         "--fantope-k",
         type=float,
         default=4.0,
-        help="Target k-Fantope spectral floor for the fantope regime",
+        help="Target k-Fantope spectral floor for fantope and anova_fantope regimes",
     )
     parser.add_argument(
         "--project-every",
         type=int,
         default=5,
         help="Projection cadence in optimization steps for the fantope regime",
+    )
+    parser.add_argument(
+        "--anova-gamma",
+        type=float,
+        default=1.5,
+        help="Power exponent gamma for ANOVA spatial patch weights",
+    )
+    parser.add_argument(
+        "--anova-floor",
+        type=float,
+        default=0.25,
+        help="Uniform simplex floor for ANOVA spatial patch weights",
     )
     parser.add_argument("--resamples", type=int, default=1, help="Number of allocation resamples")
     parser.add_argument("--steps", type=int, default=2000, help="Adam optimization steps per head")
@@ -390,6 +478,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
     started = perf_counter()
     train_data = load_goal_groups(args.train_groups, args.device, min_images=max(args.hands))
     val_data = load_goal_groups(args.val_groups, args.device)
+    num_patches = int(train_data["features"].shape[1])
     feature_dim = int(train_data["features"].shape[-1])
 
     heads_dir = args.output / "heads"
@@ -414,6 +503,9 @@ def main(argv: list[str] | None = None) -> list[dict]:
                 "steps": 0,
                 "isotropy_weight": "",
                 "fantope_k": "",
+                "anova_gamma": "",
+                "anova_floor": "",
+                "effective_patches": float(num_patches),
                 **spectral_summary(id_head),
                 **evaluate_head(id_head, val_data),
                 "elapsed_seconds": 0.0,
@@ -425,7 +517,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
             for hands in args.hands:
                 for regime in args.regimes:
                     for resample in range(args.resamples):
-                        head, config, audit_row = train_and_audit_head(
+                        head, config, audit_row, spatial_weights = train_and_audit_head(
                             train_data,
                             val_data,
                             regime=regime,
@@ -440,12 +532,19 @@ def main(argv: list[str] | None = None) -> list[dict]:
                             isotropy_weight=args.isotropy_weight,
                             fantope_k=args.fantope_k,
                             project_every=args.project_every,
+                            anova_gamma=args.anova_gamma,
+                            anova_floor=args.anova_floor,
                             seed=args.seed,
                         )
-                        lh.save_head(heads_dir / f"{audit_row['head']}.pt", head, config)
+                        ckpt_path = heads_dir / f"{audit_row['head']}.pt"
+                        if spatial_weights is not None:
+                            sch.save_spatial_channel_head(ckpt_path, spatial_weights, head, config)
+                        else:
+                            lh.save_head(ckpt_path, head, config)
                         rows.append(audit_row)
                         print(
                             f"{audit_row['head']} | r_eff={audit_row['effective_rank']:.2f} "
+                            f"p_eff={audit_row['effective_patches']:.1f} "
                             f"top1_eig={audit_row['top1_eig']:.3f} | "
                             f"val_top1={audit_row['top1']:.3f} val_auroc={audit_row['auroc']:.4f}",
                             flush=True,
@@ -465,6 +564,8 @@ def main(argv: list[str] | None = None) -> list[dict]:
         "isotropy_weight": float(args.isotropy_weight),
         "fantope_k": float(args.fantope_k),
         "project_every": int(args.project_every),
+        "anova_gamma": float(args.anova_gamma),
+        "anova_floor": float(args.anova_floor),
         "resamples": int(args.resamples),
         "steps": int(args.steps),
         "batch_size": int(args.batch_size),

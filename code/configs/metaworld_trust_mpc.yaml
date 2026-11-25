@@ -1,0 +1,18 @@
+# Calibrated 3D Meta-World Sawyer Push-v3 closed-loop Trust-MPC protocol.
+#
+# Uses horizon H=6 with step_chunks=3 (15 controls per replan, 45 total
+# controls across 3 replans), prior-centered iter-0 sampling around normalized
+# zero action, dual elite/mode certification, and exact 2 * N rollout parity.
+seed: 60000
+controls_per_chunk: 5
+cem_horizon: 6
+step_chunks: 3
+replans: 3
+cem_iterations: 2
+cem_samples: 64
+cem_elites: 8
+batch_size: 64
+stay_margin: 0.0
+sample_around_prior: true
+dual_certify: true
+replicates: 1

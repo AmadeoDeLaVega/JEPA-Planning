@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Generate publication-grade benchmark figures from saved heads and evaluation summaries.
 
-Supports three independent figure products (generated whenever the matching
+Supports four independent figure products (generated whenever the matching
 inputs are supplied):
 
   1. Eigenspectra comparison (``--heads`` and/or ``--heads-dir``)
   2. Closed-loop forest plot (``--closed-loop-json`` or ``--episodes-csv``)
-  3. Calibration budget scaling curve (``--scaling-json`` or ``--scaling-csv``,
+  3. Calibration budget scaling curve (``--scaling-input``,
      optionally joined with ``--spectral-audit`` for ``effective_rank``)
+  4. 16x16 spatial anatomy & ViT border-shortcut comparison (``--spatial-anatomy``)
 
 Usage (repository root):
   .venv/bin/python code/scripts/generate_benchmark_figures.py \
     --heads-dir results/calibrated_heads/heads \
     --closed-loop-json results/metaworld_trust_mpc/summary.json \
-    --scaling-csv results/budget_scaling.csv \
+    --scaling-input results/budget_scaling.csv \
+    --spatial-anatomy results/spatial_anatomy.npz \
     --theme light --pdf --output results/figures
 """
 
@@ -24,6 +26,7 @@ from collections import defaultdict
 import csv
 import json
 from pathlib import Path
+import pickle
 import sys
 
 import matplotlib
@@ -40,6 +43,7 @@ from jepa_planning.benchmark_figures import (  # noqa: E402
     plot_budget_scaling_curve,
     plot_closed_loop_forest,
     plot_eigenspectra_comparison,
+    plot_spatial_anatomy_comparison,
 )
 
 
@@ -269,6 +273,39 @@ def load_scaling_rows(
     return normalized
 
 
+def load_spatial_anatomy_payload(path: Path) -> dict[str, np.ndarray]:
+    """Load spatial anatomy arrays from a ``.pt``, ``.npz``, or ``.json`` mapping."""
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix == ".pt":
+        try:
+            raw = torch.load(source, map_location="cpu", weights_only=True)
+        except (pickle.UnpicklingError, RuntimeError):
+            raw = torch.load(source, map_location="cpu", weights_only=False)
+        if not isinstance(raw, dict):
+            raise ValueError(f"{source} must store a dict payload")
+    elif suffix == ".npz":
+        with np.load(source) as data:
+            raw = {key: data[key] for key in data.files}
+    elif suffix == ".json":
+        raw = json.loads(source.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError(f"{source} must store a JSON object")
+    else:
+        raise ValueError(f"Unsupported spatial anatomy format {suffix!r}; expected .pt, .npz, or .json")
+
+    required = ("rgb_frame", "gt_puck_map", "shortcut_weights", "anova_weights")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ValueError(f"{source} is missing required spatial anatomy keys: {missing}")
+
+    payload: dict[str, np.ndarray] = {}
+    for key in required:
+        val = raw[key]
+        payload[key] = val.detach().cpu().numpy() if isinstance(val, torch.Tensor) else np.asarray(val)
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser for publication benchmark figure generation."""
     parser = argparse.ArgumentParser(
@@ -301,6 +338,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Optional spectral_audit.csv/json to supply effective_rank for budget scaling",
+    )
+    parser.add_argument(
+        "--spatial-anatomy",
+        type=Path,
+        default=None,
+        help="Spatial anatomy payload (.pt, .npz, or .json) with rgb_frame, gt_puck_map, shortcut_weights, anova_weights",
     )
     parser.add_argument("--baseline-error", type=float, default=None, help="Optional baseline error line")
     parser.add_argument("--unit", choices=("px", "cm"), default=None, help="Error unit override (px or cm)")
@@ -368,10 +411,26 @@ def main(argv: list[str] | None = None) -> list[Path]:
         written.append(out_path)
         print(f"wrote {out_path}", flush=True)
 
+    if args.spatial_anatomy is not None:
+        anatomy = load_spatial_anatomy_payload(args.spatial_anatomy)
+        out_path = args.output / "spatial_anatomy_comparison.png"
+        plot_spatial_anatomy_comparison(
+            anatomy["rgb_frame"],
+            anatomy["gt_puck_map"],
+            anatomy["shortcut_weights"],
+            anatomy["anova_weights"],
+            out_path,
+            theme=args.theme,
+            dpi=args.dpi,
+            also_pdf=args.pdf,
+        )
+        written.append(out_path)
+        print(f"wrote {out_path}", flush=True)
+
     if not written:
         raise ValueError(
             "No figure inputs provided. Pass at least one of --heads/--heads-dir, "
-            "--closed-loop-json/--episodes-csv, or --scaling-input."
+            "--closed-loop-json/--episodes-csv, --scaling-input, or --spatial-anatomy."
         )
     return written
 

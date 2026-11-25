@@ -284,3 +284,102 @@ def test_generate_benchmark_figures_cli_end_to_end(tmp_path: Path):
     assert len(caught) == 0, f"unexpected warnings: {[str(w.message) for w in caught]}"
     for path in written:
         _assert_nonempty_png(path)
+
+
+def _synthetic_spatial_anatomy(grid_size: int = 16) -> dict[str, "np.ndarray"]:
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    rgb = np.zeros((224, 224, 3), dtype=np.uint8)
+    rgb[:, :, 0] = 48
+    rgb[:, :, 1] = 64
+    rgb[:, :, 2] = 84
+    # Tabletop region (rows ~8..12) and bright puck blob near row 9, col 8
+    rgb[112:182, 28:196] = np.array([175, 165, 150], dtype=np.uint8)
+    rgb[126:148, 108:132] = np.array([220, 60, 50], dtype=np.uint8)
+
+    yy, xx = np.mgrid[0:grid_size, 0:grid_size]
+    gt_puck = np.exp(-0.5 * (((yy - 9.0) / 0.85) ** 2 + ((xx - 8.0) / 1.4) ** 2))
+    gt_puck = gt_puck / gt_puck.sum()
+
+    # Shortcut map concentrated in top-2 static border rows
+    shortcut = np.full((grid_size, grid_size), 1e-4, dtype=np.float64)
+    shortcut[0, :4] = 0.20
+    shortcut[1, 12:] = 0.04
+    shortcut = shortcut / shortcut.sum()
+
+    # Closed-form ANOVA map localized on the tabletop puck region with soft floor
+    anova = 0.75 * gt_puck + 0.25 / float(grid_size * grid_size) + rng.uniform(0.0, 2e-4, size=(grid_size, grid_size))
+    anova = anova / anova.sum()
+
+    return {
+        "rgb_frame": rgb,
+        "gt_puck_map": gt_puck,
+        "shortcut_weights": shortcut,
+        "anova_weights": anova,
+    }
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_plot_spatial_anatomy_comparison_light_dark_and_1d_weights(tmp_path: Path, theme: str):
+    data = _synthetic_spatial_anatomy(16)
+    out_png = tmp_path / f"spatial_anatomy_{theme}.png"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        returned = bf.plot_spatial_anatomy_comparison(
+            data["rgb_frame"],
+            data["gt_puck_map"],
+            data["shortcut_weights"].ravel(),  # verify 1D [256] support
+            data["anova_weights"].ravel(),
+            out_png,
+            theme=theme,
+            dpi=150,
+            also_pdf=(theme == "light"),
+        )
+
+    assert returned == out_png
+    assert len(caught) == 0, f"unexpected warnings: {[str(w.message) for w in caught]}"
+    _assert_nonempty_png(out_png)
+    if theme == "light":
+        pdf_path = out_png.with_suffix(".pdf")
+        assert pdf_path.exists()
+        assert pdf_path.read_bytes().startswith(PDF_MAGIC)
+
+
+@pytest.mark.parametrize("ext", [".pt", ".npz", ".json"])
+def test_generate_benchmark_figures_cli_spatial_anatomy_formats(tmp_path: Path, ext: str):
+    import numpy as np
+
+    data = _synthetic_spatial_anatomy(16)
+    src_path = tmp_path / f"anatomy{ext}"
+    if ext == ".pt":
+        torch.save({k: torch.from_numpy(v) for k, v in data.items()}, src_path)
+    elif ext == ".npz":
+        np.savez(src_path, **data)
+    else:
+        src_path.write_text(json.dumps({k: v.tolist() for k, v in data.items()}))
+
+    out_dir = tmp_path / f"figs_{ext.lstrip('.')}"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        written = gbf.main(
+            [
+                "--spatial-anatomy",
+                str(src_path),
+                "--theme",
+                "light",
+                "--dpi",
+                "150",
+                "--pdf",
+                "--output",
+                str(out_dir),
+            ]
+        )
+
+    expected_png = out_dir / "spatial_anatomy_comparison.png"
+    assert written == [expected_png]
+    assert len(caught) == 0, f"unexpected warnings: {[str(w.message) for w in caught]}"
+    _assert_nonempty_png(expected_png)
+    expected_pdf = expected_png.with_suffix(".pdf")
+    assert expected_pdf.exists()
+    assert expected_pdf.read_bytes().startswith(PDF_MAGIC)

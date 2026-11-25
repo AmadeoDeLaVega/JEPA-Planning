@@ -32,6 +32,7 @@ import yaml  # noqa: E402
 from jepa_planning import linear_head as lh  # noqa: E402
 from jepa_planning import metaworld_planning as mwp  # noqa: E402
 from jepa_planning.pusht_multi_goal import cem_standard_normals  # noqa: E402
+from jepa_planning.spatial_channel_head import load_spatial_channel_head  # noqa: E402
 
 SUMMARY_METRICS = (
     "final_error_3d_cm",
@@ -124,6 +125,8 @@ def run_episode_suite(
     start_snapshots: list[dict],
     goals: torch.Tensor,
     cfg: dict,
+    *,
+    spatial_weights: torch.Tensor | None = None,
 ) -> list[dict]:
     """Run paired closed-loop episodes for one ``(head, planner, goal_photos)`` tuple."""
     from jepa_planning import metaworld_push as mp
@@ -131,10 +134,17 @@ def run_episode_suite(
     action_mean = model.preprocessor.action_mean.cpu().numpy()
     action_std = model.preprocessor.action_std.cpu().numpy()
     controls_per_chunk = int(cfg["controls_per_chunk"])
+    step_chunks = int(cfg.get("step_chunks", 1))
+    if step_chunks < 1:
+        raise ValueError("step_chunks must be >= 1")
+    sample_around_prior = bool(cfg.get("sample_around_prior", False))
     lower, upper, hold_chunk = mwp.metaworld_action_bounds(
         action_mean, action_std, controls_per_chunk
     )
     head_device = head.to(model.device).float()
+    spatial_weights_device = (
+        spatial_weights.to(model.device).float() if spatial_weights is not None else None
+    )
     step_weights = cfg.get("step_weights")
     replicates = int(cfg.get("replicates", 1))
     rows = []
@@ -183,7 +193,7 @@ def run_episode_suite(
                     model.action_dim,
                 )
                 if planner_name == "standard_cem":
-                    action_chunk, _, info_plan = mwp.metaworld_cem_plan(
+                    _, selected_plan, info_plan = mwp.metaworld_cem_plan(
                         model,
                         observation,
                         goal_tensor,
@@ -194,9 +204,10 @@ def run_episode_suite(
                         num_elites=int(cfg["cem_elites"]),
                         batch_size=int(cfg["batch_size"]),
                         step_weights=step_weights,
+                        spatial_weights=spatial_weights_device,
                     )
                 elif planner_name == "trust_mpc":
-                    action_chunk, previous_plan, info_plan = mwp.metaworld_trust_mpc_plan(
+                    _, previous_plan, info_plan = mwp.metaworld_trust_mpc_plan(
                         model,
                         observation,
                         goal_tensor,
@@ -211,7 +222,11 @@ def run_episode_suite(
                         stay_margin=float(cfg.get("stay_margin", 0.02)),
                         step_weights=step_weights,
                         dual_certify=bool(cfg.get("dual_certify", True)),
+                        spatial_weights=spatial_weights_device,
+                        sample_around_prior=sample_around_prior,
+                        step_chunks=step_chunks,
                     )
+                    selected_plan = previous_plan
                     jensen_violations += int(info_plan["jensen_violation"])
                     stay_gate_triggers += int(info_plan["used_stay_gate"])
                 else:
@@ -219,23 +234,26 @@ def run_episode_suite(
 
                 unrolls += int(info_plan["unrolls"])
 
-                for control in action_chunk.reshape(controls_per_chunk, 4):
-                    raw_action = np.clip(control * action_std + action_mean, -1.0, 1.0).astype(np.float32)
-                    _, _, terminated, truncated, step_info = env.step(raw_action)
-                    sim_steps += 1
-                    native_successes.append(bool(step_info.get("success", False)))
-                    if terminated or truncated:
-                        done = True
+                for chunk in selected_plan[:step_chunks]:
+                    if done:
                         break
+                    for control in chunk.reshape(controls_per_chunk, 4):
+                        raw_action = np.clip(control * action_std + action_mean, -1.0, 1.0).astype(np.float32)
+                        _, _, terminated, truncated, step_info = env.step(raw_action)
+                        sim_steps += 1
+                        native_successes.append(bool(step_info.get("success", False)))
+                        if terminated or truncated:
+                            done = True
+                            break
 
-                step_metrics = {
-                    k: float(v)
-                    for k, v in mwp.puck_metrics_cm(mp.puck_pose(env)[:3], goal_puck).items()
-                }
-                best_error_3d = min(best_error_3d, step_metrics["error_3d_cm"])
-                ever_5cm = ever_5cm or bool(step_metrics["success_5cm"])
-                ever_3cm = ever_3cm or bool(step_metrics["success_3cm"])
-                ever_2cm = ever_2cm or bool(step_metrics["success_2cm"])
+                    step_metrics = {
+                        k: float(v)
+                        for k, v in mwp.puck_metrics_cm(mp.puck_pose(env)[:3], goal_puck).items()
+                    }
+                    best_error_3d = min(best_error_3d, step_metrics["error_3d_cm"])
+                    ever_5cm = ever_5cm or bool(step_metrics["success_5cm"])
+                    ever_3cm = ever_3cm or bool(step_metrics["success_3cm"])
+                    ever_2cm = ever_2cm or bool(step_metrics["success_2cm"])
 
             rows.append(
                 {
@@ -401,10 +419,21 @@ def main() -> None:
     parser.add_argument("--tasks", type=int, default=20, help="Number of held-out tasks to evaluate")
     parser.add_argument("--replans", type=int, default=10, help="Closed-loop replans per episode")
     parser.add_argument("--horizon", type=int, default=4, help="CEM planning horizon in action chunks")
+    parser.add_argument(
+        "--step-chunks",
+        type=int,
+        default=1,
+        help="Number of planned action chunks executed per replan",
+    )
     parser.add_argument("--samples", type=int, default=64, help="Samples per CEM iteration (total budget = 2 * N)")
     parser.add_argument("--elites", type=int, default=8, help="Number of CEM elites")
     parser.add_argument("--batch-size", type=int, default=32, help="World-model unroll batch size")
     parser.add_argument("--stay-margin", type=float, default=0.02, help="Relative hold-cost gate margin")
+    parser.add_argument(
+        "--sample-around-prior",
+        action="store_true",
+        help="Center Trust-MPC iteration-0 sampling around normalized zero action prior",
+    )
     parser.add_argument("--step-weights", type=str, default=None, help="Optional horizon weights (comma/space list)")
     parser.add_argument("--no-dual-certify", action="store_true", help="Certify only elite_mean instead of dual mode")
     parser.add_argument("--seed", type=int, default=20261124, help="Base seed for common CEM random numbers")
@@ -417,12 +446,14 @@ def main() -> None:
         "seed": args.seed,
         "controls_per_chunk": 5,
         "cem_horizon": args.horizon,
+        "step_chunks": args.step_chunks,
         "replans": args.replans,
         "cem_samples": args.samples,
         "cem_elites": args.elites,
         "cem_iterations": 2,
         "batch_size": args.batch_size,
         "stay_margin": args.stay_margin,
+        "sample_around_prior": args.sample_around_prior,
         "dual_certify": not args.no_dual_certify,
         "step_weights": _parse_step_weights(args.step_weights),
         "replicates": args.replicates,
@@ -433,10 +464,12 @@ def main() -> None:
     required_photos = max(args.goal_photos) * int(cfg["replicates"])
     tasks, goals, group_cfg = load_tasks_from_groups(args.groups, required_photos, args.tasks)
 
-    heads: list[tuple[str, torch.Tensor]] = [("identity", lh.identity_head(int(goals.shape[-1])))]
+    heads: list[tuple[str, torch.Tensor, torch.Tensor | None]] = [
+        ("identity", lh.identity_head(int(goals.shape[-1])), None)
+    ]
     for path in args.head_files:
-        matrix, _ = lh.load_head(path)
-        heads.append((path.stem, matrix))
+        spatial_weights, matrix, _ = load_spatial_channel_head(path)
+        heads.append((path.stem, matrix, spatial_weights))
 
     from jepa_planning import metaworld_push as mp
     from jepa_planning.model import load_world_model
@@ -451,7 +484,7 @@ def main() -> None:
     try:
         start_snapshots = build_start_snapshots(env, tasks["target_seed"], int(group_cfg["warmup_steps"]))
         for goal_k in args.goal_photos:
-            for head_name, matrix in heads:
+            for head_name, matrix, spatial_weights in heads:
                 for planner_name in args.planners:
                     rows = run_episode_suite(
                         env,
@@ -464,6 +497,7 @@ def main() -> None:
                         start_snapshots,
                         goals,
                         cfg,
+                        spatial_weights=spatial_weights,
                     )
                     all_rows.extend(rows)
                     mean_err = float(np.mean([r["final_error_3d_cm"] for r in rows]))

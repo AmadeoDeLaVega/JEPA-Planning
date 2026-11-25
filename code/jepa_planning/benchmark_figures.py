@@ -11,17 +11,23 @@ files without requiring an interactive display backend:
     for either 2D PushT (``unit="px"``) or 3D Meta-World Sawyer Push (``unit="cm"``).
   - :func:`plot_budget_scaling_curve`: calibration budget ``B`` on a log-x axis
     against closed-loop error and spectral effective rank ``r_eff``.
+  - :func:`plot_spatial_anatomy_comparison`: four-panel 16x16 spatial patch
+    anatomy comparing the Sawyer camera view, true puck-shift energy,
+    end-to-end InfoNCE border-token shortcut collapse, and the closed-form
+    ANOVA spatial prior.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+import math
 from pathlib import Path
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 
@@ -782,3 +788,242 @@ def plot_budget_scaling_curve(
     fig.subplots_adjust(left=0.075, right=0.98, top=0.84, bottom=0.17, wspace=0.24)
     _save_figure(fig, output_path, dpi=dpi, also_pdf=also_pdf)
     return fig
+
+
+def _to_numpy(arr: np.ndarray | torch.Tensor) -> np.ndarray:
+    if isinstance(arr, torch.Tensor):
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)
+
+
+def _normalize_rgb_frame(rgb_frame: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Validate an RGB frame and return float32 ``[H, W, 3]`` in ``[0, 1]``."""
+    raw = _to_numpy(rgb_frame)
+    if raw.ndim != 3 or raw.shape[2] != 3 or min(raw.shape[:2]) == 0:
+        raise ValueError(f"rgb_frame must have shape [H, W, 3], got {tuple(raw.shape)}")
+    arr = raw.astype(np.float32)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("rgb_frame must contain finite values")
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _to_patch_grid(values: np.ndarray | torch.Tensor, name: str) -> np.ndarray:
+    """Convert a ``[G, G]`` or ``[G*G]`` patch array into a finite float64 ``[G, G]`` grid."""
+    raw = _to_numpy(values).astype(np.float64)
+    if raw.ndim == 1:
+        side = int(round(math.sqrt(raw.size)))
+        if side < 1 or side * side != raw.size:
+            raise ValueError(f"{name} 1D array length ({raw.size}) must be a positive perfect square")
+        grid = raw.reshape(side, side)
+    elif raw.ndim == 2 and min(raw.shape) > 0:
+        grid = raw
+    else:
+        raise ValueError(f"{name} must be a non-empty 2D grid or 1D square vector, got shape {tuple(raw.shape)}")
+    if not np.all(np.isfinite(grid)):
+        raise ValueError(f"{name} must contain only finite values")
+    return grid
+
+
+def _normalize_simplex_grid(grid: np.ndarray) -> np.ndarray:
+    clamped = np.maximum(grid, 0.0)
+    total = float(clamped.sum())
+    if total <= 0.0:
+        return np.full_like(clamped, 1.0 / clamped.size, dtype=np.float64)
+    return clamped / total
+
+
+def _pearson_r(first: np.ndarray, second: np.ndarray) -> float:
+    x = first.ravel().astype(np.float64)
+    y = second.ravel().astype(np.float64)
+    dx = x - x.mean()
+    dy = y - y.mean()
+    denom = float(np.linalg.norm(dx) * np.linalg.norm(dy))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.dot(dx, dy) / denom)
+
+
+def plot_spatial_anatomy_comparison(
+    rgb_frame: np.ndarray,
+    gt_puck_map: np.ndarray,
+    shortcut_weights: np.ndarray,
+    anova_weights: np.ndarray,
+    output_path: Path,
+    *,
+    theme: str = "light",
+    dpi: int = 300,
+    also_pdf: bool = False,
+) -> Path:
+    """Four-panel 16x16 spatial anatomy & ViT border-token shortcut comparison figure.
+
+    Panels (left to right):
+      1. ``Sawyer Push-v3 (corner2, 224x224)`` RGB view with subtle ``16x16`` patch grid.
+      2. ``True 5 cm Puck Shift Energy`` highlighting tabletop row-8..10 concentration.
+      3. ``End-to-End InfoNCE Spatial w`` showing border-token shortcut mass in top rows
+         and inverse-Simpson effective patch count ``P_eff``.
+      4. ``Closed-Form ANOVA Spatial Prior`` showing tabletop puck localization, ``P_eff``,
+         and Pearson ``r`` against the ground-truth puck-shift map.
+    """
+    tokens = _theme_tokens(theme)
+    rgb = _normalize_rgb_frame(rgb_frame)
+    gt_grid = _to_patch_grid(gt_puck_map, "gt_puck_map")
+    sc_grid = _to_patch_grid(shortcut_weights, "shortcut_weights")
+    an_grid = _to_patch_grid(anova_weights, "anova_weights")
+
+    if sc_grid.shape != gt_grid.shape or an_grid.shape != gt_grid.shape:
+        raise ValueError(
+            "gt_puck_map, shortcut_weights, and anova_weights must share the same grid shape"
+        )
+
+    grid_h, grid_w = gt_grid.shape
+    gt_prob = _normalize_simplex_grid(gt_grid)
+    sc_prob = _normalize_simplex_grid(sc_grid)
+    an_prob = _normalize_simplex_grid(an_grid)
+
+    p_eff_sc = float(1.0 / max(float(np.sum(sc_prob * sc_prob)), 1e-12))
+    p_eff_an = float(1.0 / max(float(np.sum(an_prob * an_prob)), 1e-12))
+    r_sc = _pearson_r(sc_prob, gt_prob)
+    r_an = _pearson_r(an_prob, gt_prob)
+
+    r_lo = min(8, grid_h - 1)
+    r_hi = min(10, grid_h - 1)
+    top_rows = min(2, grid_h)
+
+    gt_band_pct = 100.0 * float(gt_prob[r_lo : r_hi + 1, :].sum())
+    sc_top_pct = 100.0 * float(sc_prob[:top_rows, :].sum())
+    an_band_pct = 100.0 * float(an_prob[r_lo : r_hi + 1, :].sum())
+    peak_row_gt = int(np.argmax(gt_prob.sum(axis=1)))
+
+    def _display_norm(mat: np.ndarray) -> np.ndarray:
+        peak = float(mat.max())
+        return mat / peak if peak > 1e-12 else np.zeros_like(mat)
+
+    gt_disp = _display_norm(gt_prob)
+    sc_disp = _display_norm(sc_prob)
+    an_disp = _display_norm(an_prob)
+
+    fig = Figure(figsize=(13.5, 3.6), dpi=dpi, facecolor=tokens["surface"])
+    gs = fig.add_gridspec(1, 5, width_ratios=[1.0, 1.0, 1.0, 1.0, 0.055], wspace=0.14)
+    ax_rgb = fig.add_subplot(gs[0, 0])
+    ax_gt = fig.add_subplot(gs[0, 1])
+    ax_sc = fig.add_subplot(gs[0, 2])
+    ax_an = fig.add_subplot(gs[0, 3])
+    cax = fig.add_subplot(gs[0, 4])
+
+    # ---- Panel 1: RGB camera view with 16x16 patch grid ----
+    img_h, img_w = rgb.shape[:2]
+    ax_rgb.imshow(rgb, aspect="equal")
+    for idx in range(1, grid_w):
+        ax_rgb.axvline(idx * (img_w / grid_w) - 0.5, color="#ffffff", linewidth=0.45, alpha=0.32)
+    for idx in range(1, grid_h):
+        ax_rgb.axhline(idx * (img_h / grid_h) - 0.5, color="#ffffff", linewidth=0.45, alpha=0.32)
+    ax_rgb.set_xlim(-0.5, img_w - 0.5)
+    ax_rgb.set_ylim(img_h - 0.5, -0.5)
+    ax_rgb.set_xticks([])
+    ax_rgb.set_yticks([])
+    for spine in ax_rgb.spines.values():
+        spine.set_color(tokens["spine"])
+        spine.set_linewidth(0.9)
+    ax_rgb.set_title(
+        f"Sawyer Push-v3 (corner2, {img_h}x{img_w})",
+        fontsize=9.6,
+        fontweight="bold",
+        color=tokens["ink"],
+        pad=7,
+    )
+    ax_rgb.set_xlabel(
+        f"{grid_h}x{grid_w} ViT patch grid",
+        fontsize=8.3,
+        color=tokens["ink_muted"],
+        labelpad=6,
+    )
+
+    # Tick positions for patch grids (0, 4, 8, 12, 15 for 16x16)
+    step = max(1, grid_w // 4)
+    tick_pos = list(range(0, grid_w, step))
+    if tick_pos[-1] != grid_w - 1:
+        tick_pos.append(grid_w - 1)
+    y_step = max(1, grid_h // 4)
+    y_tick_pos = list(range(0, grid_h, y_step))
+    if y_tick_pos[-1] != grid_h - 1:
+        y_tick_pos.append(grid_h - 1)
+
+    heatmap_specs = [
+        (
+            ax_gt,
+            gt_disp,
+            "True 5 cm Puck Shift Energy",
+            f"Rows {r_lo}-{r_hi}: {gt_band_pct:.0f}% mass (peak row {peak_row_gt})",
+            (r_lo, r_hi, str(tokens["palette"][0])),  # type: ignore[index]
+            True,
+        ),
+        (
+            ax_sc,
+            sc_disp,
+            "End-to-End InfoNCE Spatial w",
+            f"$P_{{\\mathrm{{eff}}}}={p_eff_sc:.1f}$  |  top-{top_rows} rows: {sc_top_pct:.0f}%  |  $r={r_sc:+.2f}$",
+            (0, top_rows - 1, str(tokens["negative"])),
+            False,
+        ),
+        (
+            ax_an,
+            an_disp,
+            "Closed-Form ANOVA Spatial Prior",
+            f"$P_{{\\mathrm{{eff}}}}={p_eff_an:.1f}$  |  rows {r_lo}-{r_hi}: {an_band_pct:.0f}%  |  $r={r_an:+.2f}$",
+            (r_lo, r_hi, str(tokens["positive"])),
+            False,
+        ),
+    ]
+
+    im_handle = None
+    for ax, mat, panel_title, footer, (band_lo, band_hi, band_color), show_y_labels in heatmap_specs:
+        im_handle = ax.imshow(
+            mat,
+            cmap="inferno",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+            aspect="equal",
+        )
+        ax.add_patch(
+            Rectangle(
+                (-0.5, band_lo - 0.5),
+                grid_w,
+                band_hi - band_lo + 1,
+                fill=False,
+                edgecolor=band_color,
+                linewidth=1.55,
+                linestyle="--",
+                zorder=4,
+            )
+        )
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels([str(t) for t in tick_pos], fontsize=7.8, color=tokens["ink_muted"])
+        ax.set_yticks(y_tick_pos)
+        if show_y_labels:
+            ax.set_yticklabels([str(t) for t in y_tick_pos], fontsize=7.8, color=tokens["ink_muted"])
+            ax.set_ylabel("Patch row", fontsize=8.4, color=tokens["ink"], labelpad=3)
+        else:
+            ax.set_yticklabels([])
+        ax.tick_params(colors=tokens["ink_muted"], length=2.8, width=0.75)
+        for spine in ax.spines.values():
+            spine.set_color(tokens["spine"])
+            spine.set_linewidth(0.9)
+        ax.set_title(panel_title, fontsize=9.6, fontweight="bold", color=tokens["ink"], pad=7)
+        ax.set_xlabel(footer, fontsize=8.2, color=tokens["ink_muted"], labelpad=6)
+
+    assert im_handle is not None
+    cbar = fig.colorbar(im_handle, cax=cax)
+    cbar.set_ticks([0.0, 0.5, 1.0])
+    cbar.set_ticklabels(["0.0", "0.5", "1.0"])
+    cbar.ax.tick_params(colors=tokens["ink_muted"], labelsize=8.0, length=2.5, width=0.75)
+    cbar.set_label("Relative patch weight", fontsize=8.4, color=tokens["ink"], labelpad=5)
+    cbar.outline.set_edgecolor(tokens["spine"])
+    cbar.outline.set_linewidth(0.8)
+
+    fig.subplots_adjust(left=0.025, right=0.935, top=0.86, bottom=0.17, wspace=0.14)
+    out_path = Path(output_path)
+    _save_figure(fig, out_path, dpi=dpi, also_pdf=also_pdf)
+    return out_path

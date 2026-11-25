@@ -251,3 +251,130 @@ def test_train_calibrated_heads_without_sensitivity_and_with_identity(tmp_path: 
     assert rows[1]["regime"] == "fantope"
     assert rows[1]["effective_rank"] >= 3.0 - 1e-4
     assert not any(k.startswith("sensitivity_") for k in rows[1])
+
+
+def _write_spatially_localized_goal_groups(
+    directory: Path,
+    *,
+    num_targets: int = 12,
+    hands_per_target: int = 2,
+    patches: int = 16,
+    feature_dim: int = 16,
+    seed: int = 0,
+) -> None:
+    """Create synthetic groups where patches 0..1 carry object signal and 2..7 carry arm noise."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    t_gen = torch.Generator().manual_seed(seed + 303)
+
+    groups = np.repeat(np.arange(num_targets, dtype=np.int64), hands_per_target)
+    slots = np.tile(np.arange(hands_per_target, dtype=np.int64), num_targets)
+    n_images = len(groups)
+
+    obj_latents = rng.standard_normal((num_targets, 4)).astype(np.float32) * 3.0
+    features = torch.zeros((n_images, patches, feature_dim), dtype=torch.float32)
+    for row_idx, grp in enumerate(groups):
+        # Object patches: strong between-group signal, low within-group arm noise
+        features[row_idx, :2, :4] = torch.from_numpy(obj_latents[grp])
+        features[row_idx, :2, 4:] = torch.randn((2, feature_dim - 4), generator=t_gen) * 0.1
+        # Arm nuisance patches: high within-group variance, zero between-group signal
+        features[row_idx, 2:8, :] = torch.randn((6, feature_dim), generator=t_gen) * 2.5
+        # Static background/border patches: near-zero variance with tiny leakage
+        features[row_idx, 8:, :1] = torch.from_numpy(obj_latents[grp, :1]) * 1e-3
+        features[row_idx, 8:, 1:] = torch.randn((patches - 8, feature_dim - 1), generator=t_gen) * 1e-4
+
+    np.savez(directory / "images.npz", group=groups, slot=slots)
+    torch.save({"groups": features}, directory / "features.pt")
+
+
+def test_train_calibrated_heads_anova_regimes_and_default_preservation(tmp_path: Path):
+    from jepa_planning import spatial_channel_head as sch
+
+    # Default --regimes must remain unchanged for backwards compatibility.
+    parsed_defaults = tch.build_parser().parse_args(
+        ["--train-groups", "a", "--val-groups", "b", "--output", "c"]
+    )
+    assert parsed_defaults.regimes == ["unregularized", "isotropy", "fantope"]
+    assert parsed_defaults.anova_gamma == pytest.approx(1.5)
+    assert parsed_defaults.anova_floor == pytest.approx(0.25)
+
+    train_dir = tmp_path / "anova_train"
+    val_dir = tmp_path / "anova_val"
+    out_dir = tmp_path / "anova_out"
+
+    _write_spatially_localized_goal_groups(train_dir, num_targets=12, hands_per_target=2, patches=16, seed=11)
+    _write_spatially_localized_goal_groups(val_dir, num_targets=10, hands_per_target=2, patches=16, seed=12)
+
+    fantope_k = 3.0
+    rows = tch.main(
+        [
+            "--train-groups",
+            str(train_dir),
+            "--val-groups",
+            str(val_dir),
+            "--regimes",
+            "anova_fantope",
+            "anova_isotropy",
+            "--budgets",
+            "16",
+            "--hands",
+            "2",
+            "--ranks",
+            "8",
+            "--fantope-k",
+            str(fantope_k),
+            "--isotropy-weight",
+            "0.03",
+            "--anova-gamma",
+            "1.5",
+            "--anova-floor",
+            "0.25",
+            "--steps",
+            "30",
+            "--batch-size",
+            "16",
+            "--tau",
+            "0.2",
+            "--device",
+            "cpu",
+            "--output",
+            str(out_dir),
+        ]
+    )
+
+    assert len(rows) == 2
+    by_regime = {row["regime"]: row for row in rows}
+    assert set(by_regime.keys()) == {"anova_fantope", "anova_isotropy"}
+
+    csv_path = out_dir / "spectral_audit.csv"
+    json_path = out_dir / "spectral_audit.json"
+    with csv_path.open("r", newline="") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    assert len(csv_rows) == 2
+    assert "effective_patches" in csv_rows[0]
+
+    payload = json.loads(json_path.read_text())
+    assert payload["anova_gamma"] == pytest.approx(1.5)
+    assert payload["anova_floor"] == pytest.approx(0.25)
+    assert len(payload["rows"]) == 2
+
+    for row, csv_row in zip(rows, csv_rows):
+        ckpt_path = out_dir / row["head_path"]
+        assert ckpt_path.exists()
+        weights, head, meta = sch.load_spatial_channel_head(ckpt_path)
+        assert weights is not None
+        assert weights.shape == (16,)
+        assert float(weights.sum().item()) == pytest.approx(1.0, abs=1e-5)
+        # Object patches (0..1) receive substantially higher weight than uniform (2/16 = 0.125).
+        assert float(weights[:2].sum().item()) > 0.5
+        # Effective patches matches CSV and JSON audit values and lies strictly below 16.
+        p_eff = sch.effective_patches(weights)
+        assert 1.0 <= p_eff < 16.0
+        assert float(csv_row["effective_patches"]) == pytest.approx(p_eff, rel=1e-5, abs=1e-5)
+        assert float(row["effective_patches"]) == pytest.approx(p_eff, rel=1e-5, abs=1e-5)
+        assert meta["regime"] == row["regime"]
+        assert meta["anova_gamma"] == pytest.approx(1.5)
+        assert meta["anova_floor"] == pytest.approx(0.25)
+        assert head.shape == (8, 16)
+
+    assert float(by_regime["anova_fantope"]["effective_rank"]) >= fantope_k - 1e-4

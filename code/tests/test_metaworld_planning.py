@@ -584,3 +584,193 @@ def test_metaworld_trust_mpc_spatial_weights_and_prior_centered_shift():
             num_elites=4,
             step_chunks=0,
         )
+
+
+def test_metaworld_trust_mpc_config_and_run_episode_suite_step_chunks_and_spatial_weights(monkeypatch):
+    from types import SimpleNamespace
+
+    from experiments.run_metaworld_trust_mpc import run_episode_suite
+    from jepa_planning import metaworld_push as mp
+
+    # Verify the calibrated H=6 / step_chunks=3 protocol YAML file.
+    cfg_path = ROOT / "code/configs/metaworld_trust_mpc.yaml"
+    assert cfg_path.exists()
+    yaml_cfg = yaml.safe_load(cfg_path.read_text())
+    assert yaml_cfg["seed"] == 60000
+    assert yaml_cfg["controls_per_chunk"] == 5
+    assert yaml_cfg["cem_horizon"] == 6
+    assert yaml_cfg["step_chunks"] == 3
+    assert yaml_cfg["replans"] == 3
+    assert yaml_cfg["cem_iterations"] == 2
+    assert yaml_cfg["cem_samples"] == 64
+    assert yaml_cfg["cem_elites"] == 8
+    assert yaml_cfg["batch_size"] == 64
+    assert yaml_cfg["stay_margin"] == pytest.approx(0.0)
+    assert yaml_cfg["sample_around_prior"] is True
+    assert yaml_cfg["dual_certify"] is True
+    assert yaml_cfg["replicates"] == 1
+
+    # Mock env + patch-selective toy model to test run_episode_suite on CPU.
+    controls_per_chunk = 5
+    action_dim = 4 * controls_per_chunk
+
+    class _MockPushEnv:
+        def __init__(self):
+            self.executed_raw_actions: list[np.ndarray] = []
+            self.puck_xyz = np.array([0.0, 0.60, 0.02], dtype=np.float64)
+
+        def reset_puck(self):
+            self.executed_raw_actions = []
+            self.puck_xyz = np.array([0.0, 0.60, 0.02], dtype=np.float64)
+
+        def step(self, raw_action: np.ndarray):
+            self.executed_raw_actions.append(np.asarray(raw_action, dtype=np.float32).copy())
+            # Move puck slightly proportional to first two control dims so trajectory depends on actions.
+            self.puck_xyz = self.puck_xyz + np.array([0.002 * raw_action[0], 0.002 * raw_action[1], 0.0])
+            return np.zeros(39, dtype=np.float32), 0.0, False, False, {"success": False}
+
+    class _EpisodeToyModel:
+        def __init__(self, puck_target: torch.Tensor, arm_distractor: torch.Tensor):
+            self.device = torch.device("cpu")
+            self.action_dim = action_dim
+            self.preprocessor = SimpleNamespace(
+                action_mean=torch.from_numpy(METAWORLD_ACTION_MEAN.copy()),
+                action_std=torch.from_numpy(METAWORLD_ACTION_STD.copy()),
+            )
+            self.puck_target = puck_target.float()
+            self.arm_distractor = arm_distractor.float()
+            self.unroll_count = 0
+            self.iter0_batches: list[np.ndarray] = []
+
+        def encode(self, obs: dict) -> torch.Tensor:
+            return torch.zeros(1, 1, 4, 8)
+
+        def unroll(self, encoded_state: torch.Tensor, actions: torch.Tensor) -> dict[str, torch.Tensor]:
+            horizon, batch_size, _ = actions.shape
+            self.unroll_count += int(batch_size)
+            if batch_size == 16:
+                self.iter0_batches.append(actions.permute(1, 0, 2).detach().cpu().numpy().copy())
+            out = torch.zeros(horizon + 1, batch_size, 4, 8)
+            # Terminal visual state reflects cumulative mean control across the full horizon and chunk.
+            mean_ctrl = actions.reshape(horizon, batch_size, controls_per_chunk, 4).mean(dim=(0, 2))
+            out[-1, :, 0, :4] = mean_ctrl - self.puck_target[None, :]
+            out[-1, :, 1:, :4] = (mean_ctrl - self.arm_distractor[None, :])[:, None, :]
+            return {"visual": out}
+
+    monkeypatch.setattr(mp, "restore", lambda env, snap: env.reset_puck())
+    monkeypatch.setattr(mp, "observe", lambda env: _dummy_obs())
+    monkeypatch.setattr(mp, "puck_pose", lambda env: np.concatenate([env.puck_xyz, [1.0, 0.0, 0.0, 0.0]]))
+
+    tasks = {
+        "group": np.array([0], dtype=np.int64),
+        "target_seed": np.array([60000], dtype=np.int64),
+        "goal_puck": np.array([[0.05, 0.65, 0.02]], dtype=np.float64),
+    }
+    goals = torch.zeros((1, 1, 4, 8), dtype=torch.float32)
+    head = torch.eye(8) / np.sqrt(8.0)
+    puck_target = torch.tensor([0.8, 0.7, 0.0, 0.0], dtype=torch.float32)
+    arm_distractor = torch.tensor([-0.8, -0.7, 0.0, 0.0], dtype=torch.float32)
+    puck_weights = torch.tensor([0.97, 0.01, 0.01, 0.01], dtype=torch.float32)
+
+    suite_cfg = {
+        "seed": 60000,
+        "controls_per_chunk": controls_per_chunk,
+        "cem_horizon": 6,
+        "step_chunks": 3,
+        "replans": 3,
+        "cem_iterations": 2,
+        "cem_samples": 16,
+        "cem_elites": 4,
+        "batch_size": 16,
+        "stay_margin": 0.0,
+        "sample_around_prior": True,
+        "dual_certify": True,
+        "replicates": 1,
+    }
+
+    # Trust-MPC with step_chunks=3, sample_around_prior=True, and puck spatial_weights.
+    env_puck = _MockPushEnv()
+    model_puck = _EpisodeToyModel(puck_target, arm_distractor)
+    rows_puck = run_episode_suite(
+        env_puck,
+        model_puck,
+        head,
+        "anova_head",
+        "trust_mpc",
+        1,
+        tasks,
+        [{}],
+        goals,
+        suite_cfg,
+        spatial_weights=puck_weights,
+    )
+    assert len(rows_puck) == 1
+    assert rows_puck[0]["sim_steps"] == 3 * 3 * controls_per_chunk
+    assert len(env_puck.executed_raw_actions) == 45
+    assert rows_puck[0]["unrolls"] == 3 * (2 * 16)
+    # Verify sample_around_prior=True and step_chunks=3 warm-start padding on replan 1.
+    lower_20, upper_20, hold_20 = mwp.metaworld_action_bounds(
+        METAWORLD_ACTION_MEAN, METAWORLD_ACTION_STD, controls_per_chunk
+    )
+    assert len(model_puck.iter0_batches) == 3
+    np.testing.assert_allclose(model_puck.iter0_batches[0][0], np.tile(hold_20[None, :], (6, 1)), atol=1e-6)
+    # Replan 1 slot 1 has the last 3 chunks padded with hold_20 because step_chunks=3.
+    np.testing.assert_allclose(model_puck.iter0_batches[1][1, 3:], np.tile(hold_20[None, :], (3, 1)), atol=1e-6)
+    assert np.all(model_puck.iter0_batches[0] >= lower_20[None, None, :])
+    assert np.all(model_puck.iter0_batches[0] <= upper_20[None, None, :])
+
+    # Confirm uniform (spatial_weights=None) steers toward the opposite arm distractor.
+    env_unif = _MockPushEnv()
+    model_unif = _EpisodeToyModel(puck_target, arm_distractor)
+    rows_unif = run_episode_suite(
+        env_unif,
+        model_unif,
+        head,
+        "uniform_head",
+        "trust_mpc",
+        1,
+        tasks,
+        [{}],
+        goals,
+        suite_cfg,
+        spatial_weights=None,
+    )
+    assert rows_puck[0]["final_error_3d_cm"] < rows_unif[0]["final_error_3d_cm"]
+
+    # Confirm standard_cem also respects step_chunks=3 and spatial_weights.
+    env_cem = _MockPushEnv()
+    model_cem = _EpisodeToyModel(puck_target, arm_distractor)
+    rows_cem = run_episode_suite(
+        env_cem,
+        model_cem,
+        head,
+        "anova_head",
+        "standard_cem",
+        1,
+        tasks,
+        [{}],
+        goals,
+        suite_cfg,
+        spatial_weights=puck_weights,
+    )
+    assert rows_cem[0]["sim_steps"] == 45
+    assert rows_cem[0]["unrolls"] == 3 * (2 * 16)
+
+    # Confirm default step_chunks=1 stays backwards-compatible (1 chunk = 5 controls per replan).
+    cfg_default_chunks = dict(suite_cfg)
+    del cfg_default_chunks["step_chunks"]
+    env_default = _MockPushEnv()
+    rows_default = run_episode_suite(
+        env_default,
+        _EpisodeToyModel(puck_target, arm_distractor),
+        head,
+        "anova_head",
+        "trust_mpc",
+        1,
+        tasks,
+        [{}],
+        goals,
+        cfg_default_chunks,
+        spatial_weights=puck_weights,
+    )
+    assert rows_default[0]["sim_steps"] == 3 * 1 * controls_per_chunk
